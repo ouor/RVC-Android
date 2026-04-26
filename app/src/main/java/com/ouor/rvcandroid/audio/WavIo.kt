@@ -1,9 +1,12 @@
 package com.ouor.rvcandroid.audio
 
+import android.util.Log
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+
+private const val TAG = "Rvc.Wav"
 
 data class WavData(val samples: FloatArray, val sampleRate: Int) {
     override fun equals(other: Any?): Boolean {
@@ -20,9 +23,15 @@ object WavIo {
     private const val FORMAT_FLOAT = 3
     private const val FORMAT_EXTENSIBLE = 0xFFFE
 
-    fun read(input: InputStream): WavData = parse(input.readBytes())
+    fun read(input: InputStream): WavData {
+        val data = parse(input.readBytes())
+        val durationMs = data.samples.size * 1000L / data.sampleRate
+        Log.i(TAG, "read: ${data.samples.size} samples @ ${data.sampleRate}Hz (${durationMs}ms)")
+        return data
+    }
 
     fun write(output: OutputStream, samples: FloatArray, sampleRate: Int) {
+        Log.i(TAG, "write: ${samples.size} samples @ ${sampleRate}Hz")
         output.write(encodePcm16Mono(samples, sampleRate))
     }
 

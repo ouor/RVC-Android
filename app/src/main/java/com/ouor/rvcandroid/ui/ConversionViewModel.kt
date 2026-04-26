@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
@@ -12,6 +13,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+private const val TAG = "Rvc.Conv"
 
 data class FileSelection(val uri: Uri, val displayName: String)
 
@@ -42,11 +45,15 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
         if (s.stage == Stage.RUNNING) return
         val ctx: Context = getApplication()
         job = viewModelScope.launch {
+            Log.i(TAG, "convert: start model=${s.model.displayName} input=${s.input.displayName} output=${s.output.displayName}")
+            val t0 = System.currentTimeMillis()
             _state.update { it.copy(stage = Stage.RUNNING, progress = 0f, message = null) }
             try {
                 stubConvert(ctx, s.input.uri, s.output.uri) { p ->
                     _state.update { it.copy(progress = p) }
                 }
+                val elapsed = System.currentTimeMillis() - t0
+                Log.i(TAG, "convert: done in ${elapsed}ms")
                 _state.update {
                     it.copy(
                         stage = Stage.DONE,
@@ -55,6 +62,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             } catch (t: Throwable) {
+                Log.e(TAG, "convert: failed", t)
                 _state.update {
                     it.copy(stage = Stage.ERROR, message = t.message ?: "failed")
                 }
