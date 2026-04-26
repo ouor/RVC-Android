@@ -14,6 +14,7 @@
 
 #include <android/log.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,61 +34,12 @@ void writeError(FILE* out, uint32_t status, const std::string& msg) {
     wire::writeInferResponse(out, resp);
 }
 
-// Pack a float32 array into fp16 (uint16_t bit pattern). Same IEEE 754
-// conversion the Phase η JNI used; lifted into the runner here so the
-// host doesn't have to do FP packing twice (once for feats, once for
-// noise).
-uint16_t f32ToF16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, sizeof(x));
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const int32_t  exp  = static_cast<int32_t>((x >> 23) & 0xff) - 127 + 15;
-    const uint32_t mant = x & 0x7fffffu;
-    if (exp <= 0) {
-        if (exp < -10) return static_cast<uint16_t>(sign);
-        const uint32_t m = (mant | 0x800000u) >> (1 - exp);
-        return static_cast<uint16_t>(sign | (m + 0x1000u) >> 13);
-    }
-    if (exp >= 31) {
-        return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 1u : 0u));
-    }
-    return static_cast<uint16_t>(sign | (exp << 10) | ((mant + 0x1000u) >> 13));
-}
-
-float f16ToF32(uint16_t h) {
-    const uint32_t sign = (h & 0x8000u) << 16;
-    const uint32_t exp  = (h & 0x7c00u) >> 10;
-    const uint32_t mant = (h & 0x03ffu);
-    uint32_t out;
-    if (exp == 0) {
-        if (mant == 0) {
-            out = sign;
-        } else {
-            int e = -1;
-            uint32_t m = mant;
-            do { e++; m <<= 1; } while ((m & 0x400u) == 0);
-            m &= 0x3ffu;
-            out = sign | ((127 - 15 - e) << 23) | (m << 13);
-        }
-    } else if (exp == 31) {
-        out = sign | 0x7f800000u | (mant << 13);
-    } else {
-        out = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &out, sizeof(f));
-    return f;
-}
-
-bool setFloatAsFp16(QnnSynthRuntime& rt, const std::string& name,
-                    const std::vector<float>& src) {
-    std::vector<uint16_t> half(src.size());
-    for (size_t i = 0; i < src.size(); ++i) half[i] = f32ToF16(src[i]);
-    return rt.setInput(name, half.data(), half.size() * sizeof(uint16_t));
-}
-
 bool handleInfer(QnnSynthRuntime& rt, FILE* out, const wire::InferRequest& req) {
-    if (!setFloatAsFp16(rt, "feats", req.feats)) {
+    // feats and rand_noise arrive as fp16 raw bits packed by the host
+    // (android.util.Half); we hand the buffer straight to setInput, no
+    // per-element conversion in this process.
+    if (!rt.setInput("feats", req.feats.data(),
+                     req.feats.size() * sizeof(uint16_t))) {
         writeError(out, wire::STATUS_BAD_REQ, "setInput feats failed");
         return true;
     }
@@ -115,7 +67,8 @@ bool handleInfer(QnnSynthRuntime& rt, FILE* out, const wire::InferRequest& req) 
             return true;
         }
     }
-    if (!setFloatAsFp16(rt, "rand_noise", req.noise)) {
+    if (!rt.setInput("rand_noise", req.noise.data(),
+                     req.noise.size() * sizeof(uint16_t))) {
         writeError(out, wire::STATUS_BAD_REQ, "setInput rand_noise failed");
         return true;
     }
@@ -125,22 +78,18 @@ bool handleInfer(QnnSynthRuntime& rt, FILE* out, const wire::InferRequest& req) 
         return true;
     }
 
-    // The synth's audio output is fp16 → unpack to fp32 for the host.
-    // Output element count is fixed by the binary; address by index 0
-    // since AI Hub's qnn_context_binary compile renames the original
-    // 'audio' output to e.g. 'output_0'.
+    // Output is fp16 — copy raw bits into the response and let the host
+    // unpack to fp32. AI Hub's qnn_context_binary compile renames the
+    // original 'audio' output to e.g. 'output_0', so address by index.
     constexpr size_t AUDIO_ELEMENTS = 76800;  // 192 frames × 400 samples
-    std::vector<uint16_t> audio16(AUDIO_ELEMENTS);
-    if (!rt.getOutputByIndex(0, audio16.data(),
-                             audio16.size() * sizeof(uint16_t))) {
+    wire::InferResponse resp{};
+    resp.status = wire::STATUS_OK;
+    resp.audio.resize(AUDIO_ELEMENTS);
+    if (!rt.getOutputByIndex(0, resp.audio.data(),
+                             resp.audio.size() * sizeof(uint16_t))) {
         writeError(out, wire::STATUS_INFER, "getOutput[0] failed");
         return true;
     }
-
-    wire::InferResponse resp{};
-    resp.status = wire::STATUS_OK;
-    resp.audio.resize(audio16.size());
-    for (size_t i = 0; i < audio16.size(); ++i) resp.audio[i] = f16ToF32(audio16[i]);
     return wire::writeInferResponse(out, resp);
 }
 

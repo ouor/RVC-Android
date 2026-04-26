@@ -66,9 +66,10 @@ class QnnSynthRunner(
             )
         }
         process = pb.start()
-        // 1 MiB buffers — a single chunk request is ~735 KiB (feats +
-        // noise as fp32). Without buffering DataOutputStream's per-byte
-        // writes hammer the pipe and dominate the per-call cost.
+        // 1 MiB buffers — a single chunk request is ~370 KiB now that
+        // feats + noise are fp16; one buffer fits the whole INFR body
+        // so DataOutputStream's per-byte writes coalesce into a single
+        // pipe write.
         out = DataOutputStream(BufferedOutputStream(process.outputStream, 1 shl 20))
         inp = DataInputStream(BufferedInputStream(process.inputStream, 1 shl 20))
 
@@ -91,24 +92,29 @@ class QnnSynthRunner(
         Log.i(TAG, "runner READY")
     }
 
+    // feats and noise are fp16 raw bits (IEEE 754 binary16) packed by
+    // the caller; audio is returned as fp16 raw bits. The caller does
+    // the fp32↔fp16 conversion (android.util.Half) — sending fp16 over
+    // the wire halves the payload (~720 KiB → ~370 KiB per call) and
+    // removes the runner's old f32→f16 staging copies.
     fun infer(
-        feats: FloatArray,
+        feats: ShortArray,
         framesT: Int,
         channels: Int,
         pitch: IntArray,
         pitchf: FloatArray,
         sid: Int,
-        noise: FloatArray,
-    ): FloatArray {
+        noise: ShortArray,
+    ): ShortArray {
         writeIntLE(out, MAGIC_INFR)
         writeIntLE(out, framesT)
         writeIntLE(out, channels)
-        writeFloatArray(out, feats)
+        writeShortArray(out, feats)
         writeIntLE(out, framesT)            // p_len mirrors framesT
         writeIntArray(out, pitch)
         writeFloatArray(out, pitchf)
         writeIntLE(out, sid)
-        writeFloatArray(out, noise)
+        writeShortArray(out, noise)
         out.flush()
 
         val magic = readIntLE(inp)
@@ -116,7 +122,7 @@ class QnnSynthRunner(
             "expected RESP, got 0x${magic.toUInt().toString(16)}"
         }
         val status = readIntLE(inp)
-        val audio = readFloatArray(inp)
+        val audio = readShortArray(inp)
         val errMsg = readString(inp)
         if (status != 0) error("runner inference failed (status=$status): $errMsg")
         return audio
@@ -196,13 +202,21 @@ private fun writeIntArray(out: DataOutputStream, arr: IntArray) {
     out.write(buf.array())
 }
 
-private fun readFloatArray(inp: DataInputStream): FloatArray {
+private fun writeShortArray(out: DataOutputStream, arr: ShortArray) {
+    writeIntLE(out, arr.size)
+    if (arr.isEmpty()) return
+    val buf = ByteBuffer.allocate(arr.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+    buf.asShortBuffer().put(arr)
+    out.write(buf.array())
+}
+
+private fun readShortArray(inp: DataInputStream): ShortArray {
     val n = readIntLE(inp)
-    if (n == 0) return FloatArray(0)
-    val bytes = ByteArray(n * 4)
+    if (n == 0) return ShortArray(0)
+    val bytes = ByteArray(n * 2)
     inp.readFully(bytes)
-    val out = FloatArray(n)
-    ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out)
+    val out = ShortArray(n)
+    ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(out)
     return out
 }
 

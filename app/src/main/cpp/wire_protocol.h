@@ -33,20 +33,25 @@ constexpr uint32_t STATUS_OK       = 0;
 constexpr uint32_t STATUS_BAD_REQ  = 1;
 constexpr uint32_t STATUS_INFER    = 2;
 
+// fp16 inputs/outputs travel as raw IEEE 754 binary16 bit patterns
+// (uint16_t per element). The host (Kotlin) packs fp32→fp16 via
+// android.util.Half before write and unpacks audio fp16→fp32 after
+// read. This halves the per-call IPC payload (~720 KiB → ~370 KiB)
+// and removes the runner's old f32→f16 staging vectors.
 struct InferRequest {
     uint32_t framesT;
     uint32_t channels;
-    std::vector<float> feats;       // host-side fp32; runner packs to fp16
+    std::vector<uint16_t> feats;    // fp16 bits; passed straight to setInput
     uint32_t pLen;
     std::vector<int32_t> pitch;
-    std::vector<float> pitchf;
+    std::vector<float> pitchf;      // fp32 — graph schema pins this input fp32
     uint32_t sid;
-    std::vector<float> noise;       // host-side fp32; runner packs to fp16
+    std::vector<uint16_t> noise;    // fp16 bits; passed straight to setInput
 };
 
 struct InferResponse {
     uint32_t status;
-    std::vector<float> audio;       // fp32 (decoded from synth fp16 output)
+    std::vector<uint16_t> audio;    // fp16 bits straight from getOutputByIndex
     std::string errMsg;
 };
 
