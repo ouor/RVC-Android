@@ -2,9 +2,10 @@
 
 > 오프라인 RVC (Retrieval-based Voice Conversion) 추론을 Android에서 NPU
 > 가속으로 돌리기까지의 시행착오 기록. 최종 결과는 Snapdragon 8 Elite
-> (SM-S931N) 위에서 15초 입력 오디오를 11.3초에 변환 (실시간보다 빠름).
+> (SM-S931N) 위에서 15초 입력 오디오를 **8.9초** (warm)에 변환.
+> 합성·HuBERT·RMVPE 셋 다 DSP 위에서 동시에 돈다.
 
-## 최종 아키텍처
+## 최종 아키텍처 (올-NPU)
 
 ```
 SAF picker (Compose UI)
@@ -13,37 +14,36 @@ SAF picker (Compose UI)
    wav read + linear resample (48 kHz → 16 kHz)
         │
         ▼  audio[1, T_in]
-   ┌───────────────┐         ┌───────────────┐
-   │ HuBERT (ORT)  │         │ RMVPE  (ORT)  │
-   │  CPU EP       │         │  CPU EP       │
-   │ unit12[768]   │         │ pitchf        │
-   └───────┬───────┘         └───────┬───────┘
-           │ feats[T_total, 768]     │ pitch[T_total]
-           ▼                         ▼
-    ┌──────────────────────────────────────┐
-    │ static-T 청크 분할 (T=192 = 1.92s)   │
-    └──────────┬───────────────────────────┘
-               │  per chunk:
-               │    feats[1, 192, 768] (fp16)
-               │    rand_noise[1, 192, 192] (fp16, host-gen Gaussian)
-               │    pitch/pitchf/p_len/sid
-               ▼
-       QnnSynthRunner (Kotlin, parent process)
-               │  binary wire protocol over stdin/stdout
-               ▼
-    ┌────────────────────────────────────────────┐
-    │ librvc_synth_runner.so (PIE executable)    │
-    │   ProcessBuilder가 spawn → 별도 SELinux    │
-    │   domain → unsigned PD 가능                │
-    │   QNN 2.45 + V79 context binary (63.4 MiB) │
-    │   audio[76800] (fp16)                      │
-    └────────────────────────────────────────────┘
-               │
-               ▼  audio[T*400] fp32
-        chunk concat + trim
-               │
-               ▼
-        WAV write @ 40 kHz
+   static-T 청크 루프 (T=192, 청크 샘플 30720 = 1.92 s @ 16 kHz)
+        │
+        ├──────────────┬──────────────────────────┐
+        ▼              ▼                          ▼
+  HuBERT × 6 calls   RMVPE × 1 call         (chunk audio)
+   (5120 samples)    (30720 samples)
+   PIE runner #2     PIE runner #3
+   .bin 191 MiB      .bin 181 MiB
+        │              │
+        ▼              ▼
+   feats[90, 768]   pitchf[193]
+   → pad to 192     → truncate to 192
+        └──────────────┬──────────────────────────┘
+                       ▼  per chunk:
+                         feats[1, 192, 768] (fp16)
+                         rand_noise[1, 192, 192] (fp16, host-gen Gaussian)
+                         pitch/pitchf/p_len/sid
+                       ▼
+                QnnSynthRunner (PIE runner #1)
+                .bin 63.4 MiB
+                       │  binary wire protocol (stdin/stdout, fp16 IPC)
+                       ▼
+                audio[76800] (fp16)
+                       │
+                       ▼  fp32 unpack + chunk concat + trim
+                       ▼
+                 WAV write @ 40 kHz
+
+세 PIE 자식이 각자 fastrpc PD를 열고 DSP 위에서 동시 동작.
+(ProcessBuilder가 spawn한 자식은 별도 SELinux 도메인 → unsigned PD 가능)
 ```
 
 ## 시간순 마일스톤
@@ -200,15 +200,106 @@ tools/
   pull_vendor_deps.sh            # /vendor/lib64 NEEDED 재귀 → jniLibs
 ```
 
+### Phase ν — fp16 IPC
+
+- 호스트(Kotlin)에서 이미 `Half.toHalf`로 fp16 packing 후 `OrtSession`에
+  넘기고 있었음. 자식(C++)에서 다시 `unpack/repack`하던 구조를 정리.
+- `wire_protocol.h`의 `feats`/`noise`/`audio`를 `std::vector<uint16_t>`(fp16
+  bits)로 변경. 자식은 받은 비트 그대로 `setInput`에 넘기고, 출력도
+  `getOutputByIndex`에서 받은 fp16 비트 그대로 응답.
+- `rvc_synth_runner_main.cpp`에서 ~50줄짜리 f32↔f16 helper 제거.
+- 호스트 측 `QnnSynthRunner`도 `ShortArray`(fp16 bits)로 송수신,
+  `QnnRvcSynthesizer`가 `Half.toHalf`로 packing / 응답은 `Half.toFloat`로
+  unpack.
+- 페이로드: 청크당 ~735 KiB → ~368 KiB (절반).
+- 측정: 청크당 평균은 변화 미미했지만 wire 측면에서 깔끔. 추후 shared
+  memory로 가는 길에 쓰일 발판.
+
+### Phase ξ — HuBERT NPU
+
+- 동일 AI Hub 파이프라인으로 ContentVec(`unit12` head)을 V79 컨텍스트
+  바이너리로 컴파일 시도.
+- 첫 컴파일 에러: `Tensors {'audio', 'unit12'} occur in value_info but
+  also in model IO`. 원인은 `onnx.utils.extract_model`이 IO를
+  `value_info`에 중복으로 남기는 것. `extract_single_output()` helper에서
+  IO 이름을 `value_info`에서 제거하도록 수정.
+- 두 번째 컴파일 에러: `RouterX86 graph prepare failed 13... Requires
+  0x2ff0000 bytes of TCM, which is greater than the TCM size of
+  0x800000`. V79 VTCM은 8 MiB인데 `audio_samples=30720`에서 `conv_layers.1`
+  하나가 48 MiB 요구.
+  - `--qnn_options default_graph_htp_optimizations=O=1`은 효과 없음.
+  - `audio_samples`를 30720/6 = 5120으로 낮춰 컴파일 성공 (191 MiB .bin).
+  - 파이프라인은 청크당 6번 HuBERT 호출, 결과를 concat. ContentVec의
+    receptive field는 `frames = audio_samples/320 - 1`이라 청크당
+    `6 × 15 = 90 프레임` → `sliceFeatsToStaticT`로 192까지 replicate-pad.
+- 새 PIE runner `rvc_hubert_runner` 추가. `qnn_runtime`을 정적 라이브러리로
+  추출해 두 runner가 공유.
+- 첫 실행 에러: `getOutputByIndex(0 'output_0'): 24576 bytes asked for,
+  46080 available` → (a) 출력은 fp16일 줄 알았는데 fp32 (AI Hub가 입력
+  dtype과 일관성 유지), (b) 16 프레임이 아니라 15 프레임. 둘 다 schema
+  기반으로 수정 (`outputBinding(idx)` accessor 추가, fp32 IO).
+- 결과: HuBERT 1801 ms (CPU) → 청크당 ~28 ms × 6 × 8 청크 = ~1344 ms (NPU).
+  하지만 전체는 11.3s → 12.7s로 **느려짐**. 합성 청크 시간이 두 PD 경합
+  으로 ~485 ms → ~589 ms로 늘어 상쇄 이상. 코드는 후속 단계 위해 유지.
+
+### Phase ψ — RMVPE NPU + all-on-DSP 파이프라인
+
+- AI Hub로 RMVPE 컴파일 (`tools/compile_rmvpe_aihub.py`). 입력은
+  `waveform[1, 30720]` + `threshold[1]`, 출력은 `output_0[1, 193]`.
+  HuBERT와 달리 한 번에 30720 통째로 들어가서 청크당 1번만 호출.
+  - 출력 프레임 수가 192가 아니라 **193** (synth의 정적 T보다 1 큼).
+    파이프라인의 `sliceFloat/sliceLong`이 `raw.copyOf(target)`로 자동
+    truncate하므로 별도 처리 불필요.
+- `rvc_rmvpe_runner` PIE runner 추가 (셋째). `PitchExtractor` 인터페이스로
+  ORT/QNN 추상화 (`HubertEmbedder`와 동일 패턴).
+- 청크당 RMVPE NPU: ~212 ms (upfront ORT 1.3s 분할 vs per-chunk 8×212ms =
+  1696ms — 자체 비용은 더 비쌈).
+- **그러나 전체 파이프라인은 빨라짐**:
+
+| 구성 | warm 3-run 평균 | 비고 |
+|---|---|---|
+| ORT-only baseline | 약 11.3 s | 합성만 NPU, HuBERT/RMVPE는 CPU |
+| +HuBERT NPU | 12.7 s | 두 PD 경합으로 합성 ↑104ms/청크 |
+| +HuBERT +RMVPE NPU | **8.9 s** | 세 PD 경합 있어도 ORT 제거 효과가 큼 |
+
+- 직관에 반하는 결과의 이유: **ORT 세션과 360 MiB 캐시 mmap 자체의 비용**
+  이 컸음. ContentVec ONNX(361 MiB)와 RMVPE ONNX(345 MiB)를 둘 다 들지
+  않게 되니 메모리 압박/페이지 폴트/세션 init이 사라지고, 그게 per-chunk
+  RMVPE 추가 비용을 넘어 절약. all-NPU가 HuBERT-only NPU보다 빠르다는 게
+  이번 단계의 가장 큰 발견.
+- DSP PD 3개 동시: synth 청크당 ~485 ms → ~589 ms (HuBERT 추가 시) →
+  ~640 ms (RMVPE 추가 시). 단조 증가 확인.
+
+### 최종 검증 — 올-NPU 파이프라인 (V79, 8 chunks)
+
+```
+cold run                 16871 ms (첫 실행, .bin mmap + JIT 워밍업)
+warm run #1               8907 ms
+warm run #2               8936 ms
+
+per-chunk warm (× 8):
+  HuBERT × 6 calls      ~28 ms × 6 = 168 ms
+  RMVPE × 1 call        ~212 ms
+  Synth × 1 call        ~640 ms
+  total per chunk       ~1020 ms
+```
+
+- 출력 599892 samples @ 40 kHz. 청크당 voiced 분포 73~137/193 — 정상.
+- 세 PIE 자식이 각각 fastrpc PD를 들고 동시에 DSP에 붙어 있는 구조가
+  V79에서 안정 동작.
+
 ## 향후 최적화 후보
 
-1. **IPC 페이로드 절감**: 현재 청크당 ~735 KiB fp32 (feats + noise) 전송.
-   호스트에서 fp16으로 packing해 절반으로 줄이면 청크당 IPC 비용 감소.
+1. **int4 양자화 (Phase ω)**: AI Hub `--quantize_full_type w4a16` +
+   calibration data로 세 .bin 모두 재컴파일. HuBERT(audio quality 영향
+   가장 작음) → RMVPE → Synth 순서로 시도. Calibration corpus는 ORT
+   파이프라인에 hook 걸어 중간 텐서 캡처.
 2. **공유 메모리**: `MemoryFile` / `ASharedMemory` 또는 mmap-shared 버퍼로
-   stdin 복사 자체 제거.
+   stdin 복사 자체 제거. fp16 IPC로 절반 줄였지만 stdin pipe copy는 여전.
 3. **noise 자식 측 생성**: 호스트에서 Gaussian PRNG 돌리지 말고 자식이
    seed 받아 자체 생성하면 IPC -1/3.
-4. **HuBERT/RMVPE도 NPU**: 동일 AI Hub 경로로 컴파일 시도. 단 ContentVec은
-   361 MiB / RMVPE는 345 MiB라 컨텍스트 바이너리 사이즈 검토 필요.
+4. **HuBERT 5120 해소**: VTCM 제약을 우회하는 graph 분할 또는 conv1
+   stride 조정으로 30720 컴파일 성공 시 청크당 6번 호출이 1번이 되어
+   per-chunk 비용 추가 감소.
 5. **세션 prewarm**: 첫 청크가 두 번째보다 약간 느림 (cold path) — UI에서
    파일 로드 시점에 미리 INFR 한 번 던져 두는 식.
