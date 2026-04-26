@@ -110,6 +110,7 @@ object RvcPipelineFactory {
 
             Log.i(TAG, "factory: loading hubert")
             hubert = OrtRuntime.openSession(ctx, hubertUri)
+            val hubertOutput = chooseHubertOutput(metadata)
 
             if (metadata.f0) {
                 requireNotNull(rmvpeUri) { "f0 model selected but no rmvpe uri provided" }
@@ -119,7 +120,7 @@ object RvcPipelineFactory {
 
             return RvcPipeline(
                 metadata = metadata,
-                embedder = HubertEmbedder(hubert),
+                embedder = HubertEmbedder(hubert, hubertOutput),
                 pitchExtractor = rmvpe?.let { RmvpePitchExtractor(it) },
                 synthesizer = RvcSynthesizer(synth, metadata.f0),
             )
@@ -130,5 +131,18 @@ object RvcPipelineFactory {
             runCatching { rmvpe?.close() }
             throw t
         }
+    }
+
+    // voice-changer's content_vec_500.onnx exposes three pre-baked outputs at
+    // once: units9 (layer 9 + final_proj, 256d, v1 path), unit12 (layer 12
+    // raw, 768d, v2 path), and unit12s (layer 12 + final_proj). The synth's
+    // metadata tells us which one its TextEncoder was trained against.
+    private fun chooseHubertOutput(meta: ModelMetadata): String = when {
+        meta.embOutputLayer == 12 && !meta.useFinalProj -> "unit12"
+        meta.embOutputLayer == 9 && meta.useFinalProj -> "units9"
+        meta.embOutputLayer == 12 && meta.useFinalProj -> "unit12s"
+        else -> error(
+            "unsupported embedder config: layer=${meta.embOutputLayer}, finalProj=${meta.useFinalProj}",
+        )
     }
 }
