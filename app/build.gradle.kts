@@ -11,6 +11,8 @@ android {
         }
     }
 
+    ndkVersion = "27.1.12297006"
+
     defaultConfig {
         applicationId = "com.ouor.rvcandroid"
         minSdk = 31
@@ -24,6 +26,20 @@ android {
             // RVC inference is only feasible on modern 64-bit ARM devices.
             // Restricting ABIs avoids shipping ~150 MB of unused ORT native libs.
             abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_shared")
+                cppFlags += "-std=c++17"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 

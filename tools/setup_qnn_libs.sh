@@ -34,6 +34,7 @@ SDK="$1"
 PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
 JNI="$PROJECT/app/src/main/jniLibs/arm64-v8a"
 ASSETS="$PROJECT/app/src/main/assets/qnn_skel"
+QNN_INCLUDE="$PROJECT/app/src/main/cpp/3rdparty/qnn/include"
 
 if [ ! -d "$SDK/lib/aarch64-android" ] || [ ! -d "$SDK/lib/hexagon-v79/unsigned" ]; then
     echo "error: $SDK does not look like a QNN SDK extraction" >&2
@@ -41,7 +42,13 @@ if [ ! -d "$SDK/lib/aarch64-android" ] || [ ! -d "$SDK/lib/hexagon-v79/unsigned"
     exit 1
 fi
 
-mkdir -p "$JNI" "$ASSETS"
+mkdir -p "$JNI" "$ASSETS" "$QNN_INCLUDE"
+
+# QNN headers — needed by the native runtime in app/src/main/cpp/. Copy
+# the whole include/QNN tree so our C++ can include <QNN/...> directly.
+echo "copying QNN headers → $QNN_INCLUDE"
+rm -rf "$QNN_INCLUDE/QNN"
+cp -r "$SDK/include/QNN" "$QNN_INCLUDE/QNN"
 
 # Host-side aarch64 libs — go to jniLibs, packaged into APK as native libs.
 # AGP packaging.jniLibs.pickFirsts in app/build.gradle.kts makes our copies

@@ -20,3 +20,7 @@ local.properties
 /app/src/main/jniLibs/
 /app/src/main/assets/qnn_skel/
 qnn_build/
+
+# QNN headers populated by tools/setup_qnn_libs.sh; sourced from a
+# specific SDK extraction, not committed.
+/app/src/main/cpp/3rdparty/qnn/
