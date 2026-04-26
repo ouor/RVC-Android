@@ -26,6 +26,13 @@ data class FileSelection(val uri: Uri, val displayName: String)
 
 enum class Stage { IDLE, RUNNING, DONE, ERROR }
 
+enum class Step(val label: String) {
+    LOADING("Load"),
+    READING("Read"),
+    CONVERTING("Convert"),
+    WRITING("Write"),
+}
+
 data class ConversionUiState(
     val model: FileSelection? = null,
     val hubert: FileSelection? = null,
@@ -35,7 +42,8 @@ data class ConversionUiState(
     val f0UpKey: Int = 0,
     val speakerId: Long = 0L,
     val stage: Stage = Stage.IDLE,
-    val progress: Float = 0f,
+    val runningStep: Step? = null,
+    val elapsedMs: Long? = null,
     val message: String? = null,
 )
 
@@ -68,27 +76,31 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                     "rmvpe=${s.rmvpe?.displayName ?: "-"} input=${s.input.displayName} " +
                     "f0UpKey=${s.f0UpKey} sid=${s.speakerId}",
             )
-            _state.update { it.copy(stage = Stage.RUNNING, progress = 0f, message = "Loading models…") }
+            _state.update {
+                it.copy(
+                    stage = Stage.RUNNING,
+                    runningStep = Step.LOADING,
+                    elapsedMs = null,
+                    message = null,
+                )
+            }
             try {
                 val pipe = obtainPipeline(ctx, s.model.uri, s.hubert.uri, s.rmvpe?.uri)
-                _state.update { it.copy(progress = 0.05f, message = "Reading input…") }
+                _state.update { it.copy(runningStep = Step.READING) }
 
                 val wav = ctx.contentResolver.openInputStream(s.input.uri)
                     ?.use { WavIo.read(it) }
                     ?: error("cannot read input")
                 val audio16k = Resampler.resample(wav.samples, wav.sampleRate, HUBERT_SAMPLE_RATE)
-                _state.update { it.copy(progress = 0.1f, message = "Converting…") }
+                _state.update { it.copy(runningStep = Step.CONVERTING) }
 
                 val out = pipe.convert(
                     audio16k = audio16k,
                     f0UpKey = s.f0UpKey,
                     speakerId = s.speakerId,
-                    onProgress = { p ->
-                        _state.update { it.copy(progress = 0.1f + p * 0.85f) }
-                    },
                 )
 
-                _state.update { it.copy(progress = 0.95f, message = "Writing output…") }
+                _state.update { it.copy(runningStep = Step.WRITING) }
                 ctx.contentResolver.openOutputStream(s.output.uri)
                     ?.use { WavIo.write(it, out, pipe.outputSampleRate) }
                     ?: error("cannot write output")
@@ -98,8 +110,9 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(
                         stage = Stage.DONE,
-                        progress = 1f,
-                        message = "Saved to ${s.output.displayName} (${elapsed}ms)",
+                        runningStep = null,
+                        elapsedMs = elapsed,
+                        message = null,
                     )
                 }
             } catch (t: Throwable) {
@@ -107,6 +120,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(
                         stage = Stage.ERROR,
+                        runningStep = null,
                         message = "${t.javaClass.simpleName}: ${t.message ?: "unknown error"}",
                     )
                 }

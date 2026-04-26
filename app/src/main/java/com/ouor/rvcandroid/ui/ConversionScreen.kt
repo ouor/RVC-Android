@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -19,11 +20,11 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.LargeTopAppBar
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -74,6 +75,12 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
         state.output != null &&
         state.stage != Stage.RUNNING
 
+    val convertLabel = when {
+        state.stage == Stage.RUNNING -> "Converting…"
+        state.stage == Stage.DONE -> "Convert again"
+        else -> "Convert"
+    }
+
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
     Scaffold(
@@ -87,9 +94,12 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
         bottomBar = {
             BottomConvertBar(
                 stage = state.stage,
-                progress = state.progress,
+                runningStep = state.runningStep,
+                outputName = state.output?.displayName,
+                elapsedMs = state.elapsedMs,
                 message = state.message,
                 enabled = canConvert,
+                buttonLabel = convertLabel,
                 onConvert = vm::convert,
             )
         },
@@ -238,28 +248,26 @@ private fun CardHeader(
 @Composable
 private fun BottomConvertBar(
     stage: Stage,
-    progress: Float,
+    runningStep: Step?,
+    outputName: String?,
+    elapsedMs: Long?,
     message: String?,
     enabled: Boolean,
+    buttonLabel: String,
     onConvert: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            if (stage == Stage.RUNNING || progress > 0f) {
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-            message?.let { msg ->
-                Text(
-                    text = msg,
-                    color = if (stage == Stage.ERROR)
-                        MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                )
+            when {
+                stage == Stage.RUNNING && runningStep != null -> {
+                    StepRow(
+                        current = runningStep,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    )
+                }
+                stage == Stage.DONE -> ResultBanner(outputName, elapsedMs)
+                stage == Stage.ERROR -> ErrorBanner(message)
+                else -> {}
             }
             Button(
                 onClick = onConvert,
@@ -268,11 +276,130 @@ private fun BottomConvertBar(
                     .fillMaxWidth()
                     .padding(16.dp),
             ) {
-                Text(if (stage == Stage.RUNNING) "Converting…" else "Convert")
+                Text(buttonLabel)
             }
         }
     }
 }
+
+@Composable
+private fun StepRow(current: Step, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Step.entries.forEach { step ->
+            val state = when {
+                step == current -> StepUiState.Active
+                step.ordinal < current.ordinal -> StepUiState.Done
+                else -> StepUiState.Pending
+            }
+            StepChip(
+                step = step,
+                state = state,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+private enum class StepUiState { Done, Active, Pending }
+
+@Composable
+private fun StepChip(step: Step, state: StepUiState, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val (bg, fg) = when (state) {
+        StepUiState.Done -> cs.primary to cs.onPrimary
+        StepUiState.Active -> cs.primaryContainer to cs.onPrimaryContainer
+        StepUiState.Pending -> cs.surfaceVariant to cs.onSurfaceVariant
+    }
+    Surface(
+        color = bg,
+        shape = MaterialTheme.shapes.small,
+        modifier = modifier,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+        ) {
+            when (state) {
+                StepUiState.Done -> Text(
+                    text = "✓",
+                    color = fg,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                StepUiState.Active -> CircularProgressIndicator(
+                    modifier = Modifier.size(12.dp),
+                    strokeWidth = 1.5.dp,
+                    color = fg,
+                )
+                StepUiState.Pending -> Spacer(Modifier.size(12.dp))
+            }
+            Text(
+                text = step.label,
+                color = fg,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ResultBanner(outputName: String?, elapsedMs: Long?) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "✓",
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            val headline = buildString {
+                append("Saved")
+                if (elapsedMs != null) append(" in ${formatDuration(elapsedMs)}")
+            }
+            Text(
+                text = headline,
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            outputName?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ErrorBanner(message: String?) {
+    if (message == null) return
+    Text(
+        text = message,
+        color = MaterialTheme.colorScheme.error,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+    )
+}
+
+private fun formatDuration(ms: Long): String =
+    if (ms < 60_000L) String.format(java.util.Locale.US, "%.1fs", ms / 1000f)
+    else "${ms / 60_000L}m ${(ms % 60_000L) / 1000L}s"
 
 @Composable
 private fun FileRow(
