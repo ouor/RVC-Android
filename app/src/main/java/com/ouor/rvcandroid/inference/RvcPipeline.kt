@@ -15,7 +15,7 @@ class RvcPipeline(
     val metadata: ModelMetadata,
     private val embedder: HubertEmbedder,
     private val pitchExtractor: RmvpePitchExtractor?,
-    private val synthesizer: RvcSynthesizer,
+    private val synthesizer: RvcSynth,
 ) : Closeable {
 
     val outputSampleRate: Int get() = metadata.samplingRate
@@ -368,7 +368,31 @@ class RvcPipeline(
 }
 
 object RvcPipelineFactory {
+    // Hard-coded metadata for QNN .bin loads. AI Hub strips the ONNX-
+    // embedded metadata when emitting the context binary, so we cannot
+    // round-trip the same JSON we put in via export_static_synthesizer.
+    // These values are tied to the Tsukuyomi v2 40k test model that
+    // tools/compile_synth_aihub.py compiled. Different models will need
+    // either matching constants or a sidecar metadata file (a follow-up
+    // can have the compile script emit one alongside the .bin).
+    private const val QNN_DEFAULT_SR = 40000
+    private const val QNN_DEFAULT_T = 192
+    private const val QNN_DEFAULT_INTER_CHANNELS = 192
+
     fun create(
+        ctx: Context,
+        modelUri: Uri,
+        hubertUri: Uri,
+        rmvpeUri: Uri?,
+    ): RvcPipeline {
+        val displayName = queryDisplayName(ctx, modelUri)
+        val isQnnBinary = displayName.endsWith(".bin", ignoreCase = true)
+        Log.i(TAG, "factory: synth file '$displayName' → backend=${if (isQnnBinary) "QNN" else "ORT"}")
+        return if (isQnnBinary) createQnn(ctx, modelUri, hubertUri, rmvpeUri)
+        else createOnnx(ctx, modelUri, hubertUri, rmvpeUri)
+    }
+
+    private fun createOnnx(
         ctx: Context,
         modelUri: Uri,
         hubertUri: Uri,
@@ -378,7 +402,7 @@ object RvcPipelineFactory {
         var hubert: OrtSession? = null
         var rmvpe: OrtSession? = null
         try {
-            Log.i(TAG, "factory: loading synthesizer")
+            Log.i(TAG, "factory: loading synthesizer (ORT)")
             synth = OrtRuntime.openSession(ctx, modelUri)
             val metadata = ModelMetadata.fromSession(synth)
                 ?: error("synthesizer has no embedded metadata; export it via voice-changer")
@@ -410,6 +434,88 @@ object RvcPipelineFactory {
             runCatching { rmvpe?.close() }
             throw t
         }
+    }
+
+    private fun createQnn(
+        ctx: Context,
+        modelUri: Uri,
+        hubertUri: Uri,
+        rmvpeUri: Uri?,
+    ): RvcPipeline {
+        var hubert: OrtSession? = null
+        var rmvpe: OrtSession? = null
+        var qnnSynth: QnnRvcSynthesizer? = null
+        try {
+            // Synthetic metadata mirrors what the corresponding .onnx
+            // would have set; HuBERT/RMVPE branching uses these fields.
+            val metadata = ModelMetadata(
+                samplingRate = QNN_DEFAULT_SR,
+                f0 = true,
+                embChannels = 768,
+                embedder = "hubert_base",
+                embOutputLayer = 12,
+                useFinalProj = false,
+                modelType = "QnnContextBinary",
+                version = "static-1.0",
+                staticT = QNN_DEFAULT_T,
+            )
+
+            Log.i(TAG, "factory: caching QNN .bin")
+            val cachedBin = cacheBinUri(ctx, modelUri)
+            Log.i(TAG, "factory: loading QNN synthesizer from ${cachedBin.name}")
+            qnnSynth = QnnRvcSynthesizer(
+                binPath = cachedBin.absolutePath,
+                staticT = QNN_DEFAULT_T,
+                interChannels = QNN_DEFAULT_INTER_CHANNELS,
+                outputSampleRate = QNN_DEFAULT_SR,
+            )
+
+            Log.i(TAG, "factory: loading hubert (ORT)")
+            hubert = OrtRuntime.openSession(ctx, hubertUri)
+
+            requireNotNull(rmvpeUri) { "QNN binary expects f0 — rmvpe required" }
+            Log.i(TAG, "factory: loading rmvpe (ORT)")
+            rmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
+
+            return RvcPipeline(
+                metadata = metadata,
+                embedder = HubertEmbedder(hubert, chooseHubertOutput(metadata)),
+                pitchExtractor = RmvpePitchExtractor(rmvpe),
+                synthesizer = qnnSynth,
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "factory: QNN path aborting; closing partials", t)
+            runCatching { qnnSynth?.close() }
+            runCatching { hubert?.close() }
+            runCatching { rmvpe?.close() }
+            throw t
+        }
+    }
+
+    private fun cacheBinUri(ctx: Context, uri: Uri): java.io.File {
+        val expected = ctx.contentResolver.openFileDescriptor(uri, "r")
+            ?.use { it.statSize } ?: -1L
+        val key = uri.toString().hashCode().toLong().let { kotlin.math.abs(it) }
+        val cached = java.io.File(ctx.cacheDir, "qnn-$key-$expected.bin")
+        if (cached.exists() && cached.length() == expected && expected > 0L) {
+            Log.d(TAG, "cacheBinUri: reusing ${cached.name}")
+            return cached
+        }
+        ctx.cacheDir.listFiles { f -> f.name.startsWith("qnn-$key-") }
+            ?.forEach { if (it != cached) runCatching { it.delete() } }
+        Log.i(TAG, "cacheBinUri: copying $uri → ${cached.name} ($expected bytes)")
+        ctx.contentResolver.openInputStream(uri)?.use { input ->
+            cached.outputStream().use { input.copyTo(it) }
+        } ?: error("cannot open .bin uri: $uri")
+        return cached
+    }
+
+    private fun queryDisplayName(ctx: Context, uri: Uri): String {
+        ctx.contentResolver.query(
+            uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+            null, null, null,
+        )?.use { c -> if (c.moveToFirst()) return c.getString(0) }
+        return uri.lastPathSegment ?: "(unknown)"
     }
 
     private fun chooseHubertOutput(meta: ModelMetadata): String = when {

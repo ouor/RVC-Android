@@ -14,7 +14,7 @@ class RvcSynthesizer(
     private val session: OrtSession,
     private val hasF0: Boolean,
     declaredStaticT: Int? = null,
-) : Closeable {
+) : RvcSynth {
 
     private val featsIsFp16: Boolean = featsType(session) == OnnxJavaType.FLOAT16
     private val audioIsFp16: Boolean = audioType(session) == OnnxJavaType.FLOAT16
@@ -23,7 +23,7 @@ class RvcSynthesizer(
     // declared value from ModelMetadata.staticT, but also infer from the
     // session schema so an ONNX exported without metadata.staticT (older
     // tooling) still gets routed through the static path.
-    val staticT: Int? = declaredStaticT ?: detectStaticTFromSchema(session)
+    override val staticT: Int? = declaredStaticT ?: detectStaticTFromSchema(session)
 
     init {
         Log.i(
@@ -33,13 +33,13 @@ class RvcSynthesizer(
         )
     }
 
-    fun infer(
+    override fun infer(
         feats: FloatArray,
         framesT: Int,
         channels: Int,
-        pitch: LongArray? = null,
-        pitchf: FloatArray? = null,
-        speakerId: Long = 0L,
+        pitch: LongArray?,
+        pitchf: FloatArray?,
+        speakerId: Long,
     ): FloatArray {
         val tStart = System.nanoTime()
         require(feats.size == framesT * channels) {
