@@ -2,6 +2,7 @@ package com.ouor.rvcandroid.inference
 
 import ai.onnxruntime.NodeInfo
 import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import ai.onnxruntime.providers.NNAPIFlags
@@ -13,9 +14,20 @@ import java.util.EnumSet
 import kotlin.math.absoluteValue
 
 private const val TAG = "Rvc.Ort"
+private const val ORT_LOG_ID = "rvc-ort"
 
 object OrtRuntime {
-    val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    // INFO-level env unlocks NNAPI partition reports ("Number of partitions
+    // supported by NNAPI: X / Y") and the per-op fallback warnings that tell
+    // us whether the EP is actually dispatching to silicon. ORT's native
+    // logger routes to logcat under tag "onnxruntime" on Android — filter
+    // with `adb logcat -v brief onnxruntime:V *:S` alongside Rvc.* tags.
+    val env: OrtEnvironment = OrtEnvironment.getEnvironment(
+        OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO,
+        ORT_LOG_ID,
+    ).also {
+        Log.i(TAG, "init: env created at INFO (log_id=$ORT_LOG_ID)")
+    }
 
     fun openSession(file: File): OrtSession {
         val t0 = System.currentTimeMillis()
@@ -27,7 +39,17 @@ object OrtRuntime {
         )
         Log.d(TAG, "  inputs:  ${describe(session.inputInfo)}")
         Log.d(TAG, "  outputs: ${describe(session.outputInfo)}")
+        // Newer ORT Java APIs expose getProviders(); reflective lookup avoids
+        // hard-failing if the bundled binary doesn't have it.
+        runCatching {
+            val providers = OrtSession::class.java.getMethod("getProviders").invoke(session)
+            Log.i(TAG, "  providers: $providers")
+        }
         return session
+    }
+
+    fun openSession(ctx: Context, uri: Uri): OrtSession {
+        return openSession(ensureCachedFile(ctx, uri))
     }
 
     // NNAPI dispatches to whatever vendor accelerator the device exposes
@@ -38,27 +60,25 @@ object OrtRuntime {
     // the driver supports it; precision loss is bounded by RVC's already
     // lossy synthesis path and the speedup on NPU silicon is large.
     private fun createWithFallback(file: File): Pair<OrtSession, String> {
-        val nnapiOpts = OrtSession.SessionOptions().apply {
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        }
+        val nnapiOpts = newOptions()
         try {
             nnapiOpts.addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
+            Log.i(TAG, "createWithFallback: trying NNAPI (USE_FP16) for ${file.name}")
             return env.createSession(file.absolutePath, nnapiOpts) to "NNAPI"
         } catch (t: Throwable) {
             Log.w(
                 TAG,
-                "openSession: NNAPI rejected ${file.name} (${t.javaClass.simpleName}: ${t.message}); falling back to CPU",
+                "createWithFallback: NNAPI rejected ${file.name} (${t.javaClass.simpleName}: ${t.message}); falling back to CPU",
             )
             runCatching { nnapiOpts.close() }
         }
-        val cpuOpts = OrtSession.SessionOptions().apply {
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        }
-        return env.createSession(file.absolutePath, cpuOpts) to "CPU"
+        return env.createSession(file.absolutePath, newOptions()) to "CPU"
     }
 
-    fun openSession(ctx: Context, uri: Uri): OrtSession {
-        return openSession(ensureCachedFile(ctx, uri))
+    private fun newOptions(): OrtSession.SessionOptions = OrtSession.SessionOptions().apply {
+        setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
+        setSessionLogVerbosityLevel(0)
     }
 
     // SAF URIs cannot be opened as filesystem paths, but ORT's mmap-backed

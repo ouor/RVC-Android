@@ -24,21 +24,24 @@ class RmvpePitchExtractor(private val session: OrtSession) : Closeable {
         f0UpKey: Int = 0,
         threshold: Float = 0.3f,
     ): PitchData {
-        val t0 = System.currentTimeMillis()
+        val tStart = System.nanoTime()
         val env = OrtRuntime.env
 
         env.floatTensor(audio16k, longArrayOf(1L, audio16k.size.toLong())).use { wav ->
             env.floatTensor(floatArrayOf(threshold), longArrayOf(1L)).use { thr ->
+                val tBuilt = System.nanoTime()
                 session.run(mapOf("waveform" to wav, "threshold" to thr)).use { result ->
+                    val tRan = System.nanoTime()
                     val pitchTensor = result.iterator().next().value as OnnxTensor
                     val raw = pitchTensor.copyFloats()
                     val shifted = if (f0UpKey == 0) raw else shift(raw, f0UpKey)
                     val coarse = melQuantize(shifted)
-                    val elapsed = System.currentTimeMillis() - t0
+                    val tDone = System.nanoTime()
                     Log.i(
                         TAG,
                         "extract: audio=${audio16k.size} samples → pitchf[${shifted.size}] " +
-                            "(voiced=${coarse.count { it > 1 }}/${coarse.size}) in ${elapsed}ms",
+                            "(voiced=${coarse.count { it > 1 }}/${coarse.size}) " +
+                            "(build=${(tBuilt - tStart) / 1_000_000}ms run=${(tRan - tBuilt) / 1_000_000}ms decode=${(tDone - tRan) / 1_000_000}ms)",
                     )
                     return PitchData(shifted, coarse)
                 }

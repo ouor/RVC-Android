@@ -25,11 +25,13 @@ class HubertEmbedder(
     }
 
     fun extract(audio16k: FloatArray): EmbeddingData {
-        val t0 = System.currentTimeMillis()
+        val tStart = System.nanoTime()
         val env = OrtRuntime.env
 
         env.floatTensor(audio16k, longArrayOf(1L, audio16k.size.toLong())).use { audio ->
+            val tBuilt = System.nanoTime()
             session.run(mapOf("audio" to audio), setOf(outputName)).use { result ->
+                val tRan = System.nanoTime()
                 val tensor = result.iterator().next().value as OnnxTensor
                 val shape = (tensor.info as TensorInfo).shape
                 require(shape.size == 3 && shape[0] == 1L) {
@@ -38,10 +40,11 @@ class HubertEmbedder(
                 val frames = shape[1].toInt()
                 val channels = shape[2].toInt()
                 val feats = tensor.copyFloats()
-                val elapsed = System.currentTimeMillis() - t0
+                val tDone = System.nanoTime()
                 Log.i(
                     TAG,
-                    "extract: audio=${audio16k.size} → $outputName[1, $frames, $channels] in ${elapsed}ms",
+                    "extract: audio=${audio16k.size} → $outputName[1, $frames, $channels] " +
+                        "(build=${(tBuilt - tStart) / 1_000_000}ms run=${(tRan - tBuilt) / 1_000_000}ms decode=${(tDone - tRan) / 1_000_000}ms)",
                 )
                 return EmbeddingData(feats, frames, channels)
             }

@@ -30,7 +30,7 @@ class RvcSynthesizer(
         pitchf: FloatArray? = null,
         speakerId: Long = 0L,
     ): FloatArray {
-        val t0 = System.currentTimeMillis()
+        val tStart = System.nanoTime()
         require(feats.size == framesT * channels) {
             "feats size ${feats.size} != $framesT * $channels"
         }
@@ -54,19 +54,22 @@ class RvcSynthesizer(
                 inputs["pitch"] = env.longTensor(pitch!!, tShape)
                 inputs["pitchf"] = env.floatTensor(pitchf!!, tShape)
             }
+            val tBuilt = System.nanoTime()
             // Some voice-changer exports surface debug intermediates (Mul_*,
             // Slice_*, RandomNormalLike_*, …) in addition to "audio" — pulling
             // only what we need keeps inference cheap and the result mapping
             // robust to schema additions.
             session.run(inputs, setOf(AUDIO_OUTPUT)).use { result ->
+                val tRan = System.nanoTime()
                 val tensor = result.iterator().next().value as OnnxTensor
                 val audio =
                     if (audioIsFp16) tensor.copyFloats16() else tensor.copyFloats()
                 clipInPlace(audio)
-                val elapsed = System.currentTimeMillis() - t0
+                val tDone = System.nanoTime()
                 Log.i(
                     TAG,
-                    "infer: feats[$framesT,$channels] f0=$hasF0 sid=$speakerId → audio[${audio.size}] in ${elapsed}ms",
+                    "infer: feats[$framesT,$channels] f0=$hasF0 sid=$speakerId → audio[${audio.size}] " +
+                        "(build=${(tBuilt - tStart) / 1_000_000}ms run=${(tRan - tBuilt) / 1_000_000}ms decode=${(tDone - tRan) / 1_000_000}ms)",
                 )
                 return audio
             }
