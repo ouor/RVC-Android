@@ -62,6 +62,18 @@ def main() -> int:
         help="skip onnx-simplifier (it can fail on some graphs; raw export still works)",
     )
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset (default 17)")
+    parser.add_argument(
+        "--external-noise",
+        action="store_true",
+        help=(
+            "patch the synth's forward() so the variational z_p sample uses an "
+            "externally-supplied noise tensor instead of torch.randn_like. "
+            "Required for QNN — Hexagon HTP cannot execute RandomNormalLike "
+            "and Qualcomm AI Hub fails the compile otherwise. The runtime "
+            "must then generate noise on CPU and pass it as the new "
+            "'rand_noise' input."
+        ),
+    )
     args = parser.parse_args()
 
     server_dir = os.path.join(args.voice_changer, "server")
@@ -122,6 +134,28 @@ def main() -> int:
     if is_half:
         net_g = net_g.half()
 
+    inter_channels = cpt["config"][2]
+
+    if args.external_noise:
+        if not f0:
+            sys.exit("--external-noise is only implemented for the f0 (NSFsid) variant")
+        import types
+
+        def forward_external_noise(self, phone, phone_lengths, pitch, nsff0, sid, rand_noise):
+            g = self.emb_g(sid).unsqueeze(-1)
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+            z_p = (m_p + torch.exp(logs_p) * rand_noise * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            o = self.dec(z * x_mask, nsff0, g=g)
+            o = torch.clip(o[0, 0], -1.0, 1.0)
+            return o
+
+        net_g.forward = types.MethodType(forward_external_noise, net_g)
+        print(
+            f"forward() patched: rand_noise input replaces torch.randn_like, shape "
+            f"will be (1, {inter_channels}, T)"
+        )
+
     T = args.frames
     feats_dtype = torch.float16 if is_half else torch.float32
     feats = torch.zeros(1, T, emb_channels, dtype=feats_dtype, device=device)
@@ -131,8 +165,13 @@ def main() -> int:
     if f0:
         pitch = torch.zeros(1, T, dtype=torch.int64, device=device)
         pitchf = torch.zeros(1, T, dtype=torch.float32, device=device)
-        input_names = ["feats", "p_len", "pitch", "pitchf", "sid"]
-        inputs = (feats, p_len, pitch, pitchf, sid)
+        if args.external_noise:
+            rand_noise = torch.zeros(1, inter_channels, T, dtype=feats_dtype, device=device)
+            input_names = ["feats", "p_len", "pitch", "pitchf", "sid", "rand_noise"]
+            inputs = (feats, p_len, pitch, pitchf, sid, rand_noise)
+        else:
+            input_names = ["feats", "p_len", "pitch", "pitchf", "sid"]
+            inputs = (feats, p_len, pitch, pitchf, sid)
     else:
         input_names = ["feats", "p_len", "sid"]
         inputs = (feats, p_len, sid)
@@ -140,17 +179,45 @@ def main() -> int:
     output_names = ["audio"]
 
     print(f"exporting fixed T={T} → {args.output}")
-    # No dynamic_axes — every shape is concrete. This is the whole point.
-    torch.onnx.export(
-        net_g,
-        inputs,
-        args.output,
-        do_constant_folding=False,
-        opset_version=args.opset,
-        verbose=False,
-        input_names=input_names,
-        output_names=output_names,
-    )
+
+    # NSF's SineGen has its own torch.randn_like (models.py:387) for the
+    # phase-noise component on unvoiced frames. Hexagon HTP can't run
+    # RandomNormalLike, so when --external-noise is set we zero those
+    # internal randn_like calls during the trace too. Side effect: the
+    # synthesised waveform for unvoiced regions has no breath/noise
+    # component. Acceptable for verifying NPU dispatch; revisit if
+    # output sounds clinical (a second 'noise_src' input could replace
+    # this in a follow-up).
+    if args.external_noise:
+        original_randn_like = torch.randn_like
+        original_randn = torch.randn
+
+        def zeros_like_proxy(input, *a, **k):
+            return torch.zeros_like(input)
+
+        def zeros_proxy(*size, **k):
+            return torch.zeros(*size, **{kk: vv for kk, vv in k.items() if kk in ("dtype", "device", "layout")})
+
+        torch.randn_like = zeros_like_proxy
+        torch.randn = zeros_proxy
+        print("torch.randn{,_like} → zeros during trace (NSF SineGen phase noise disabled)")
+
+    try:
+        # No dynamic_axes — every shape is concrete. This is the whole point.
+        torch.onnx.export(
+            net_g,
+            inputs,
+            args.output,
+            do_constant_folding=False,
+            opset_version=args.opset,
+            verbose=False,
+            input_names=input_names,
+            output_names=output_names,
+        )
+    finally:
+        if args.external_noise:
+            torch.randn_like = original_randn_like
+            torch.randn = original_randn
 
     import onnx
 
@@ -183,6 +250,8 @@ def main() -> int:
         "embOutputLayer": emb_layer,
         "useFinalProj": use_final_proj,
         "staticT": T,
+        "externalNoise": args.external_noise,
+        "interChannels": inter_channels,
     }
     meta = model.metadata_props.add()
     meta.key = "metadata"

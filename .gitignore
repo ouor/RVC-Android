@@ -19,3 +19,4 @@ local.properties
 # commit; anyone building runs the script once.
 /app/src/main/jniLibs/
 /app/src/main/assets/qnn_skel/
+qnn_build/
