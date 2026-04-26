@@ -13,3 +13,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# QNN runtime libs populated by tools/setup_qnn_libs.sh from a local SDK
+# extraction. Too large (~112 MB) and tied to a specific SDK version to
+# commit; anyone building runs the script once.
+/app/src/main/jniLibs/
+/app/src/main/assets/qnn_skel/

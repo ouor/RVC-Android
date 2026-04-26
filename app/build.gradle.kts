@@ -47,6 +47,18 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // onnxruntime-android-qnn:1.22 ships QNN SDK 2.25 libs inside its
+            // AAR; tools/setup_qnn_libs.sh drops 2.45 versions into
+            // src/main/jniLibs. pickFirsts makes our copies win the merge.
+            // Without this AGP fails the build with a duplicate-file error.
+            pickFirsts += listOf(
+                "lib/arm64-v8a/libQnnHtp.so",
+                "lib/arm64-v8a/libQnnSystem.so",
+                "lib/arm64-v8a/libQnnHtpV79Stub.so",
+                "lib/arm64-v8a/libQnnHtpPrepare.so",
+            )
+        }
     }
 }
 

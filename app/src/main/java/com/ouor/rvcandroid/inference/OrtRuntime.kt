@@ -7,6 +7,7 @@ import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.net.Uri
+import android.system.Os
 import android.util.Log
 import java.io.File
 import kotlin.math.absoluteValue
@@ -28,26 +29,64 @@ object OrtRuntime {
     @Volatile
     private var qnnPreloaded: Boolean = false
 
-    // Android's runtime linker only resolves bare-name dlopen against libs
-    // that live in the calling APK's namespace, and ORT's C++ side dlopens
-    // the QNN backend (libQnnHtp.so etc.) by basename. System.loadLibrary
-    // pulls the SOs into our namespace ahead of time so ORT's later dlopen
-    // hits the namespace cache instead of failing on path resolution.
+    // Three things have to be in place before ORT can stand up a QNN HTP
+    // session on a Snapdragon device:
+    //
+    //   1. host-side libQnn*.so loaded into our linker namespace, so ORT's
+    //      C++ dlopen("libQnnHtp.so") resolves by basename.
+    //   2. Hexagon-side skel libs (libQnnHtpV79Skel.so etc.) extracted to a
+    //      directory the DSP can read. They can't live in jniLibs — Android
+    //      refuses to load Hexagon binaries from an aarch64-v8a slot — so
+    //      we bundle them in /assets/qnn_skel and copy to filesDir at
+    //      first run.
+    //   3. ADSP_LIBRARY_PATH env var pointing at that filesDir, so the QNN
+    //      HTP host driver tells the DSP where to dlopen the skel.
     fun ensureInitialized(ctx: Context) {
-        if (nativeLibDir == null) {
-            nativeLibDir = ctx.applicationInfo.nativeLibraryDir
-            Log.i(TAG, "ensureInitialized: nativeLibDir=$nativeLibDir")
+        if (qnnPreloaded) return
+        nativeLibDir = ctx.applicationInfo.nativeLibraryDir
+        Log.i(TAG, "ensureInitialized: nativeLibDir=$nativeLibDir")
+        extractHexagonSkels(ctx)
+        for (name in listOf("QnnSystem", "QnnHtp")) {
+            runCatching { System.loadLibrary(name) }
+                .onSuccess { Log.i(TAG, "ensureInitialized: preloaded lib$name.so") }
+                .onFailure { e ->
+                    Log.w(TAG, "ensureInitialized: preload lib$name.so failed: ${e.message}")
+                }
         }
-        if (!qnnPreloaded) {
-            for (name in listOf("QnnSystem", "QnnHtp")) {
-                runCatching { System.loadLibrary(name) }
-                    .onSuccess { Log.i(TAG, "ensureInitialized: preloaded lib$name.so") }
-                    .onFailure { e ->
-                        Log.w(TAG, "ensureInitialized: preload lib$name.so failed: ${e.message}")
-                    }
+        qnnPreloaded = true
+    }
+
+    private fun extractHexagonSkels(ctx: Context) {
+        val skelDir = File(ctx.filesDir, "qnn_skel").also { it.mkdirs() }
+        val assetNames = ctx.assets.list("qnn_skel") ?: emptyArray()
+        if (assetNames.isEmpty()) {
+            Log.w(
+                TAG,
+                "extractHexagonSkels: no assets/qnn_skel/ contents — run tools/setup_qnn_libs.sh",
+            )
+        }
+        for (name in assetNames) {
+            val out = File(skelDir, name)
+            if (out.exists() && out.length() > 0) continue
+            Log.i(TAG, "extractHexagonSkels: $name → ${out.absolutePath}")
+            ctx.assets.open("qnn_skel/$name").use { input ->
+                out.outputStream().use { input.copyTo(it) }
             }
-            qnnPreloaded = true
         }
+        // Default ADSP search path varies by OEM, but /system/lib/rfsa/adsp +
+        // /vendor/lib/rfsa/adsp + /dsp covers what every Snapdragon Android
+        // device exposes. Prepending our extracted dir gets the QNN HTP
+        // driver to use OUR skel for V79 instead of any older system one.
+        val current = runCatching { System.getenv("ADSP_LIBRARY_PATH") }.getOrNull().orEmpty()
+        val newPath = buildString {
+            append(skelDir.absolutePath)
+            append(';')
+            if (current.isNotEmpty()) append(current).append(';')
+            append("/system/lib/rfsa/adsp;/vendor/lib/rfsa/adsp;/dsp")
+        }
+        runCatching { Os.setenv("ADSP_LIBRARY_PATH", newPath, true) }
+            .onSuccess { Log.i(TAG, "ADSP_LIBRARY_PATH=$newPath") }
+            .onFailure { e -> Log.w(TAG, "setenv ADSP_LIBRARY_PATH failed: ${e.message}") }
     }
 
     fun openSession(file: File): OrtSession {
@@ -95,19 +134,15 @@ object OrtRuntime {
         return env.createSession(file.absolutePath, newOptions()) to "CPU"
     }
 
+    // With the SDK 2.45 lib swap (tools/setup_qnn_libs.sh + packaging
+    // pickFirsts in build.gradle.kts) ORT 1.22's QNN EP calls into a
+    // driver that actually knows about Hexagon V79. We don't pass htp_arch
+    // here because ORT 1.22's ParseHtpArchitecture enum doesn't include 79
+    // — leaving it unset lets the newer driver auto-detect from the
+    // running chip, which is what we want anyway.
     private fun qnnHtpOptions(): Map<String, String> {
-        // backend_path is what ORT dlopens to enter QNN. The bare name works
-        // because ensureInitialized already loaded libQnnHtp.so into the app
-        // namespace. htp_performance_mode=burst gives best inference latency
-        // (highest clock, no thermal pacing), and finalization mode 3 lets
-        // QNN spend more time at session-creation tuning the graph for the
-        // specific HTP chip — fine for an offline pipeline where load
-        // latency is amortized across a whole conversion.
         return mapOf(
             "backend_path" to "libQnnHtp.so",
-            "htp_performance_mode" to "burst",
-            "htp_graph_finalization_optimization_mode" to "3",
-            "enable_htp_fp16_precision" to "1",
         )
     }
 
