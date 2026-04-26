@@ -5,28 +5,49 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
-import ai.onnxruntime.providers.NNAPIFlags
 import android.content.Context
 import android.net.Uri
 import android.util.Log
 import java.io.File
-import java.util.EnumSet
 import kotlin.math.absoluteValue
 
 private const val TAG = "Rvc.Ort"
 private const val ORT_LOG_ID = "rvc-ort"
 
 object OrtRuntime {
-    // INFO-level env unlocks NNAPI partition reports ("Number of partitions
-    // supported by NNAPI: X / Y") and the per-op fallback warnings that tell
-    // us whether the EP is actually dispatching to silicon. ORT's native
-    // logger routes to logcat under tag "onnxruntime" on Android — filter
-    // with `adb logcat -v brief onnxruntime:V *:S` alongside Rvc.* tags.
     val env: OrtEnvironment = OrtEnvironment.getEnvironment(
         OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO,
         ORT_LOG_ID,
     ).also {
         Log.i(TAG, "init: env created at INFO (log_id=$ORT_LOG_ID)")
+    }
+
+    @Volatile
+    private var nativeLibDir: String? = null
+
+    @Volatile
+    private var qnnPreloaded: Boolean = false
+
+    // Android's runtime linker only resolves bare-name dlopen against libs
+    // that live in the calling APK's namespace, and ORT's C++ side dlopens
+    // the QNN backend (libQnnHtp.so etc.) by basename. System.loadLibrary
+    // pulls the SOs into our namespace ahead of time so ORT's later dlopen
+    // hits the namespace cache instead of failing on path resolution.
+    fun ensureInitialized(ctx: Context) {
+        if (nativeLibDir == null) {
+            nativeLibDir = ctx.applicationInfo.nativeLibraryDir
+            Log.i(TAG, "ensureInitialized: nativeLibDir=$nativeLibDir")
+        }
+        if (!qnnPreloaded) {
+            for (name in listOf("QnnSystem", "QnnHtp")) {
+                runCatching { System.loadLibrary(name) }
+                    .onSuccess { Log.i(TAG, "ensureInitialized: preloaded lib$name.so") }
+                    .onFailure { e ->
+                        Log.w(TAG, "ensureInitialized: preload lib$name.so failed: ${e.message}")
+                    }
+            }
+            qnnPreloaded = true
+        }
     }
 
     fun openSession(file: File): OrtSession {
@@ -39,8 +60,6 @@ object OrtRuntime {
         )
         Log.d(TAG, "  inputs:  ${describe(session.inputInfo)}")
         Log.d(TAG, "  outputs: ${describe(session.outputInfo)}")
-        // Newer ORT Java APIs expose getProviders(); reflective lookup avoids
-        // hard-failing if the bundled binary doesn't have it.
         runCatching {
             val providers = OrtSession::class.java.getMethod("getProviders").invoke(session)
             Log.i(TAG, "  providers: $providers")
@@ -49,30 +68,47 @@ object OrtRuntime {
     }
 
     fun openSession(ctx: Context, uri: Uri): OrtSession {
+        ensureInitialized(ctx)
         return openSession(ensureCachedFile(ctx, uri))
     }
 
-    // NNAPI dispatches to whatever vendor accelerator the device exposes
-    // (Hexagon NPU on Snapdragon, NPU on Exynos, etc.). It can refuse a
-    // graph for many reasons — unsupported op, dynamic shape it can't
-    // partition, version mismatch — so we always carry a CPU-only retry
-    // path. USE_FP16 lets NNAPI run FP32 graphs in FP16 internally where
-    // the driver supports it; precision loss is bounded by RVC's already
-    // lossy synthesis path and the speedup on NPU silicon is large.
+    // QNN HTP dispatches op kernels to the Hexagon NPU. Fallback chain is
+    // QNN → CPU. NNAPI is dropped from the chain: on this generation of
+    // Snapdragon it partitioned 0 ops on our dynamic-shape graphs (verified
+    // via BFCArena allocation logs and the absence of NNAPI partition
+    // reports in INFO-level ORT logs), so it added load latency for no
+    // throughput gain. With static-shape models from Phase γ onward, QNN's
+    // partitioner has a real chance of claiming the synthesizer.
     private fun createWithFallback(file: File): Pair<OrtSession, String> {
-        val nnapiOpts = newOptions()
+        val qnnOpts = newOptions()
         try {
-            nnapiOpts.addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
-            Log.i(TAG, "createWithFallback: trying NNAPI (USE_FP16) for ${file.name}")
-            return env.createSession(file.absolutePath, nnapiOpts) to "NNAPI"
+            qnnOpts.addQnn(qnnHtpOptions())
+            Log.i(TAG, "createWithFallback: trying QNN HTP for ${file.name}")
+            return env.createSession(file.absolutePath, qnnOpts) to "QNN"
         } catch (t: Throwable) {
             Log.w(
                 TAG,
-                "createWithFallback: NNAPI rejected ${file.name} (${t.javaClass.simpleName}: ${t.message}); falling back to CPU",
+                "createWithFallback: QNN rejected ${file.name} (${t.javaClass.simpleName}: ${t.message}); falling back to CPU",
             )
-            runCatching { nnapiOpts.close() }
+            runCatching { qnnOpts.close() }
         }
         return env.createSession(file.absolutePath, newOptions()) to "CPU"
+    }
+
+    private fun qnnHtpOptions(): Map<String, String> {
+        // backend_path is what ORT dlopens to enter QNN. The bare name works
+        // because ensureInitialized already loaded libQnnHtp.so into the app
+        // namespace. htp_performance_mode=burst gives best inference latency
+        // (highest clock, no thermal pacing), and finalization mode 3 lets
+        // QNN spend more time at session-creation tuning the graph for the
+        // specific HTP chip — fine for an offline pipeline where load
+        // latency is amortized across a whole conversion.
+        return mapOf(
+            "backend_path" to "libQnnHtp.so",
+            "htp_performance_mode" to "burst",
+            "htp_graph_finalization_optimization_mode" to "3",
+            "enable_htp_fp16_precision" to "1",
+        )
     }
 
     private fun newOptions(): OrtSession.SessionOptions = OrtSession.SessionOptions().apply {
