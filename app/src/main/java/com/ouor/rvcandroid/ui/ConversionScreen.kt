@@ -12,22 +12,25 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -38,7 +41,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 
@@ -69,8 +74,16 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
         state.output != null &&
         state.stage != Stage.RUNNING
 
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+
     Scaffold(
-        topBar = { TopAppBar(title = { Text("RVC Android") }) },
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        topBar = {
+            LargeTopAppBar(
+                title = { Text("RVC Android") },
+                scrollBehavior = scrollBehavior,
+            )
+        },
         bottomBar = {
             BottomConvertBar(
                 stage = state.stage,
@@ -135,7 +148,7 @@ private fun ModelsCard(
     val total = 3
     val filled = listOf(model, hubert, rmvpe).count { it != null }
 
-    Card {
+    ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column {
             CardHeader(
                 title = "Models",
@@ -164,7 +177,7 @@ private fun IoCard(
     onPickInput: () -> Unit,
     onPickOutput: () -> Unit,
 ) {
-    Card {
+    ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -182,7 +195,7 @@ private fun OptionsCard(
     onF0Change: (Int) -> Unit,
     onSpeakerIdChange: (Long) -> Unit,
 ) {
-    Card {
+    ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -269,18 +282,51 @@ private fun FileRow(
 ) {
     Column {
         Text(text = label, style = MaterialTheme.typography.labelLarge)
-        Spacer(Modifier.height(4.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onPick) {
+        Spacer(Modifier.height(6.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            FilledTonalButton(onClick = onPick) {
                 Text(if (selection == null) "Select" else "Change")
             }
-            Spacer(Modifier.width(12.dp))
-            Text(
-                text = selection ?: "(not selected)",
-                style = MaterialTheme.typography.bodyMedium,
+            FileStatusChip(
+                selection = selection,
+                onClick = onPick,
+                modifier = Modifier.weight(1f),
             )
         }
     }
+}
+
+@Composable
+private fun FileStatusChip(
+    selection: String?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val filled = selection != null
+    AssistChip(
+        onClick = onClick,
+        modifier = modifier,
+        label = {
+            Text(
+                text = selection ?: "Not selected",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        leadingIcon = if (filled) {
+            { Text("✓", style = MaterialTheme.typography.labelLarge) }
+        } else null,
+        colors = if (filled) {
+            AssistChipDefaults.assistChipColors(
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                labelColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                leadingIconContentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+        } else AssistChipDefaults.assistChipColors(),
+    )
 }
 
 @Composable
