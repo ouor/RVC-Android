@@ -15,6 +15,9 @@ data class ModelMetadata(
     val useFinalProj: Boolean,
     val modelType: String? = null,
     val version: String? = null,
+    // Set by tools/export_static_synthesizer.py when the synth was exported
+    // with fixed T (no dynamic_axes). Drives the static-T pipeline path.
+    val staticT: Int? = null,
 ) {
     companion object {
         // voice-changer's export2onnx.py embeds these as a single JSON string under
@@ -40,6 +43,7 @@ data class ModelMetadata(
                 useFinalProj = o.optBoolean("useFinalProj", false),
                 modelType = o.optString("modelType").ifEmpty { null },
                 version = o.optString("version").ifEmpty { null },
+                staticT = if (o.has("staticT")) o.getInt("staticT") else null,
             )
         }
     }

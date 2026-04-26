@@ -271,7 +271,11 @@ object RvcPipelineFactory {
                 metadata = metadata,
                 embedder = HubertEmbedder(hubert, hubertOutput),
                 pitchExtractor = rmvpe?.let { RmvpePitchExtractor(it) },
-                synthesizer = RvcSynthesizer(synth, metadata.f0),
+                synthesizer = RvcSynthesizer(
+                    session = synth,
+                    hasF0 = metadata.f0,
+                    declaredStaticT = metadata.staticT,
+                ),
             )
         } catch (t: Throwable) {
             Log.e(TAG, "factory: aborting; closing partial sessions", t)

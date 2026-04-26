@@ -13,13 +13,24 @@ private const val AUDIO_OUTPUT = "audio"
 class RvcSynthesizer(
     private val session: OrtSession,
     private val hasF0: Boolean,
+    declaredStaticT: Int? = null,
 ) : Closeable {
 
     private val featsIsFp16: Boolean = featsType(session) == OnnxJavaType.FLOAT16
     private val audioIsFp16: Boolean = audioType(session) == OnnxJavaType.FLOAT16
 
+    // Static models pin the synth's T axis (feats[1, T, C]). Prefer the
+    // declared value from ModelMetadata.staticT, but also infer from the
+    // session schema so an ONNX exported without metadata.staticT (older
+    // tooling) still gets routed through the static path.
+    val staticT: Int? = declaredStaticT ?: detectStaticTFromSchema(session)
+
     init {
-        Log.i(TAG, "init: hasF0=$hasF0 featsFp16=$featsIsFp16 audioFp16=$audioIsFp16")
+        Log.i(
+            TAG,
+            "init: hasF0=$hasF0 featsFp16=$featsIsFp16 audioFp16=$audioIsFp16 " +
+                "T=${staticT?.toString() ?: "dynamic"}",
+        )
     }
 
     fun infer(
@@ -33,6 +44,11 @@ class RvcSynthesizer(
         val tStart = System.nanoTime()
         require(feats.size == framesT * channels) {
             "feats size ${feats.size} != $framesT * $channels"
+        }
+        if (staticT != null) {
+            require(framesT == staticT) {
+                "static synth expects T=$staticT, got T=$framesT — caller must chunk to fixed T"
+            }
         }
         if (hasF0) {
             requireNotNull(pitch) { "f0 model requires pitch" }
@@ -96,5 +112,14 @@ class RvcSynthesizer(
 
         fun audioType(session: OrtSession): OnnxJavaType? =
             (session.outputInfo[AUDIO_OUTPUT]?.info as? TensorInfo)?.type
+
+        // Reads feats:[1, T, C] and returns T iff it's a concrete value.
+        // Dynamic exports show T=-1; static exports pin it (e.g. 192).
+        fun detectStaticTFromSchema(session: OrtSession): Int? {
+            val info = (session.inputInfo["feats"]?.info as? TensorInfo) ?: return null
+            val shape = info.shape
+            if (shape.size != 3) return null
+            return if (shape[1] > 0) shape[1].toInt() else null
+        }
     }
 }
