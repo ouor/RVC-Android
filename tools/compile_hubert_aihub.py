@@ -16,13 +16,31 @@ time on activations we never read. The extraction uses
 onnx.utils.extract_model, which preserves all transitive ops and
 weights leading to the chosen output.
 
+W8A16 quantization (Phase ω)
+----------------------------
+With --quantize w8a16 (and a calibration .npz produced by
+tools/build_calibration_corpus.py), this script first runs an AI Hub
+submit_quantize_job that turns the FP32 ONNX into a QDQ ONNX with
+INT8 weights and INT16 activations, then compiles that QDQ ONNX into
+a context binary. Two jobs ⇒ two dashboard URLs; both must succeed.
+
 Usage
 -----
+    # FP16 (default):
     python tools/compile_hubert_aihub.py \\
-        --input C:/Users/hurwy/Downloads/_/02.onnx \\
+        --input C:/Users/hurwy/Downloads/_/content_vec_500.onnx \\
         --output-dir ./qnn_build/ai_hub \\
-        --audio-samples 30720 \\
+        --audio-samples 5120 \\
         --output-tensor unit12
+
+    # W8A16:
+    python tools/compile_hubert_aihub.py \\
+        --input C:/Users/hurwy/Downloads/_/content_vec_500.onnx \\
+        --output-dir ./qnn_build/ai_hub \\
+        --audio-samples 5120 \\
+        --output-tensor unit12 \\
+        --quantize w8a16 \\
+        --calibration-npz qnn_build/calibration/audio_corpus.npz
 
 Requires `pip install qai_hub onnx` and ~/.qai_hub/client.ini configured.
 """
@@ -30,6 +48,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import qai_hub as hub
 
 
@@ -37,6 +56,41 @@ import qai_hub as hub
 # loads the synth and HuBERT contexts on the same DSP, so they must
 # agree on the architecture.
 TARGET_DEVICE_NAME = "Samsung Galaxy S25"
+
+
+def staticize_onnx_locally(src_path: Path, dst_path: Path,
+                           input_dims: dict[str, tuple[int, ...]]) -> None:
+    """Bake static input shapes into an ONNX before upload.
+
+    AI Hub's submit_quantize_job rejects models with dynamic axes, and its
+    compile-job route to staticize (--target_runtime onnx) sometimes mangles
+    shape info on uncommon ops (we hit that with RMVPE's STFT). Doing the
+    dim_param → dim_value substitution locally and rerunning shape inference
+    avoids both problems.
+    """
+    import onnx
+    from onnx import shape_inference
+
+    model = onnx.load(str(src_path))
+    for inp in model.graph.input:
+        if inp.name not in input_dims:
+            continue
+        new_dims = input_dims[inp.name]
+        shape = inp.type.tensor_type.shape
+        if len(shape.dim) != len(new_dims):
+            sys.exit(f"input '{inp.name}' has rank {len(shape.dim)}, "
+                     f"got {len(new_dims)} dims to set")
+        for i, d in enumerate(new_dims):
+            shape.dim[i].Clear()
+            shape.dim[i].dim_value = int(d)
+
+    # Strip any value_info entries — shape inference will rebuild them with
+    # the new static shapes propagated through the graph.
+    del model.graph.value_info[:]
+    inferred = shape_inference.infer_shapes(model, strict_mode=False)
+    onnx.save(inferred, str(dst_path))
+    print(f"  static ONNX → {dst_path} "
+          f"({dst_path.stat().st_size / (1024 * 1024):.1f} MiB)")
 
 
 def extract_single_output(src_path: Path, output_name: str, dst_path: Path) -> None:
@@ -105,7 +159,23 @@ def main() -> int:
                         help="reuse a previously uploaded model_id instead of re-uploading. "
                              "Skips the extract+upload steps (handy for retrying with "
                              "different compile flags).")
+    parser.add_argument("--quantize", choices=("w8a16",), default=None,
+                        help="run an AI Hub submit_quantize_job before compile, "
+                             "producing a QDQ ONNX with the chosen weight/act dtypes. "
+                             "Currently only w8a16 (INT8 weights, INT16 activations).")
+    parser.add_argument("--calibration-npz", default=None,
+                        help="path to .npz from tools/build_calibration_corpus.py. "
+                             "Required when --quantize is set. Picks the audio_5120 "
+                             "or audio_30720 array based on --audio-samples.")
+    parser.add_argument("--quantized-model-id", default=None,
+                        help="reuse a previously produced quantized model_id; skips the "
+                             "quantize step entirely. Mutually exclusive with --quantize.")
     args = parser.parse_args()
+
+    if args.quantize and args.quantized_model_id:
+        sys.exit("--quantize and --quantized-model-id are mutually exclusive")
+    if args.quantize and not args.calibration_npz:
+        sys.exit("--quantize requires --calibration-npz")
 
     onnx_path = Path(args.input)
     if not onnx_path.is_file():
@@ -137,6 +207,63 @@ def main() -> int:
     }
     print(f"input_specs: {input_specs}")
 
+    # ---- optional quantize step ------------------------------------------
+    # AI Hub's submit_quantize_job rejects models with dynamic axes ("convert
+    # dynamic shapes to static using a compile job that provides the input
+    # shapes and targets ONNX runtime"). So when --quantize is set we run
+    # an extra compile_job(--target_runtime onnx) first to bake static
+    # shapes into a fresh ONNX, then feed that to the quantize job.
+    quantize_label = "fp16"
+    model_for_compile = raw
+    if args.quantize:
+        npz_path = Path(args.calibration_npz)
+        if not npz_path.is_file():
+            sys.exit(f"calibration npz not found: {npz_path}")
+        npz = np.load(str(npz_path))
+        key = f"audio_{args.audio_samples}"
+        if key not in npz.files:
+            sys.exit(f"calibration npz {npz_path.name} has no array '{key}' "
+                     f"(available: {npz.files}). "
+                     f"Re-run build_calibration_corpus.py with the right window.")
+        windows = npz[key]  # (N, audio_samples) fp32
+        calib_samples = [w.reshape(1, args.audio_samples).astype(np.float32) for w in windows]
+
+        print("submitting pre-compile job → static ONNX (for quantize input)")
+        static_job = hub.submit_compile_job(
+            model=raw,
+            device=device,
+            input_specs=input_specs,
+            options="--target_runtime onnx",
+            name=f"rvc-hubert-static-{args.audio_samples}-{args.output_tensor}-staticize",
+        )
+        print(f"  job_id={static_job.job_id}, dashboard: {static_job.url}")
+        print("waiting for staticize to finish…")
+        static_model = static_job.get_target_model()
+        if static_model is None:
+            sys.exit("staticize compile failed — see dashboard URL above")
+        print(f"static ONNX model: {static_model.model_id}")
+
+        print(f"quantize: weights=INT8, activations=INT16, "
+              f"calibration N={len(calib_samples)} from {npz_path}")
+        quantize_job = hub.submit_quantize_job(
+            model=static_model,
+            calibration_data={"audio": calib_samples},
+            weights_dtype=hub.QuantizeDtype.INT8,
+            activations_dtype=hub.QuantizeDtype.INT16,
+            name=f"rvc-hubert-static-{args.audio_samples}-{args.output_tensor}-w8a16",
+        )
+        print(f"  job_id={quantize_job.job_id}, dashboard: {quantize_job.url}")
+        print("waiting for quantize to finish (typical 5-15 min)…")
+        model_for_compile = quantize_job.get_target_model()
+        if model_for_compile is None:
+            sys.exit("quantize failed — see dashboard URL above")
+        print(f"quantized QDQ model: {model_for_compile.model_id}")
+        quantize_label = "w8a16"
+    elif args.quantized_model_id:
+        print(f"reusing quantized model_id: {args.quantized_model_id}")
+        model_for_compile = hub.get_model(args.quantized_model_id)
+        quantize_label = "w8a16"
+
     options_parts = ["--target_runtime qnn_context_binary", "--truncate_64bit_io"]
     if args.htp_O is not None:
         options_parts.append(
@@ -147,11 +274,11 @@ def main() -> int:
 
     print("submitting compile job → QNN context binary")
     compile_job = hub.submit_compile_job(
-        model=raw,
+        model=model_for_compile,
         device=device,
         input_specs=input_specs,
         options=options,
-        name=f"rvc-hubert-static-{args.audio_samples}-{args.output_tensor}",
+        name=f"rvc-hubert-static-{args.audio_samples}-{args.output_tensor}-{quantize_label}",
     )
     print(f"  job_id={compile_job.job_id}, dashboard: {compile_job.url}")
     print("waiting for compile to finish (typical 5-15 min)…")
@@ -160,7 +287,8 @@ def main() -> int:
         sys.exit("compile failed — see dashboard URL above for the build log")
     print(f"compiled model: {compiled.model_id}")
 
-    archive = output_dir / f"{onnx_path.stem}_{args.output_tensor}_static_{args.audio_samples}_qnn_v79.bin"
+    suffix = f"_{quantize_label}" if quantize_label != "fp16" else ""
+    archive = output_dir / f"{onnx_path.stem}_{args.output_tensor}_static_{args.audio_samples}{suffix}_qnn_v79.bin"
     print(f"downloading → {archive}")
     compiled.download(str(archive))
     print(f"  bytes: {archive.stat().st_size}")
