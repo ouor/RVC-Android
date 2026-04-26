@@ -12,19 +12,31 @@ class EmbeddingData(val feats: FloatArray, val frames: Int, val channels: Int) {
     val shape: LongArray get() = longArrayOf(1L, frames.toLong(), channels.toLong())
 }
 
-class HubertEmbedder(
+// Two backends share this interface: OrtHubertEmbedder (CPU/NNAPI via
+// onnxruntime, accepts any audio length) and QnnHubertEmbedder (NPU via
+// a spawned PIE runner, requires exactly staticAudioLen samples per
+// call). The pipeline branches on staticAudioLen to decide whether to
+// embed the full clip up front or per-synth-chunk.
+interface HubertEmbedder : Closeable {
+    val staticAudioLen: Int?
+    fun extract(audio16k: FloatArray): EmbeddingData
+}
+
+class OrtHubertEmbedder(
     private val session: OrtSession,
     private val outputName: String,
-) : Closeable {
+) : HubertEmbedder {
+
+    override val staticAudioLen: Int? = null
 
     init {
         require(outputName in session.outputInfo.keys) {
             "hubert ONNX has no '$outputName' output (available: ${session.outputInfo.keys})"
         }
-        Log.i(TAG, "init: outputName=$outputName")
+        Log.i(TAG, "init: backend=ORT outputName=$outputName")
     }
 
-    fun extract(audio16k: FloatArray): EmbeddingData {
+    override fun extract(audio16k: FloatArray): EmbeddingData {
         val tStart = System.nanoTime()
         val env = OrtRuntime.env
 

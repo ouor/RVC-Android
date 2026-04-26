@@ -143,18 +143,14 @@ class RvcPipeline(
         return concat(parts)
     }
 
-    // Static-T path: the synthesizer's T axis is pinned (e.g. 192). HuBERT
-    // and RMVPE run once on the full audio (zero-padded to a multiple of
-    // chunkSamples = staticT × WINDOW); their outputs are sliced into N
-    // synth calls of exactly staticT frames each. The final concat is
-    // trimmed back to the original duration so the appended zero-pad is
-    // discarded.
-    //
-    // Why upfront HuBERT/RMVPE rather than per-chunk: HuBERT's transformer
-    // attention sees the whole sequence at once, giving each output frame
-    // richer context than it would in a 1.92s window. RMVPE is a CNN+GRU
-    // and similarly benefits. Both scale near-linearly in length, so the
-    // upfront cost is no worse than the sum of per-chunk calls would be.
+    // Static-T path: the synthesizer's T axis is pinned (e.g. 192).
+    // RMVPE runs once on the full padded audio (CNN+GRU is fine on the
+    // long sequence and slicing per-chunk is cheap). HuBERT either
+    // runs once upfront (ORT path — gives each frame the full clip's
+    // attention context) or per-chunk (QNN path — the .bin baked a
+    // static audio_samples shape, so we have no choice). The final
+    // concat is trimmed back to the original duration so the appended
+    // zero-pad is discarded.
     private fun convertStaticChunked(
         audio: FloatArray,
         f0UpKey: Int,
@@ -170,39 +166,108 @@ class RvcPipeline(
         val padded = if (paddedLen == originalLen) audio else FloatArray(paddedLen).also {
             System.arraycopy(audio, 0, it, 0, originalLen)
         }
+        val numChunks = paddedLen / chunkSamples
+
+        val perChunkHubert = embedder.staticAudioLen != null
+        val hubertSubLen: Int
+        val hubertCallsPerChunk: Int
+        if (perChunkHubert) {
+            hubertSubLen = embedder.staticAudioLen!!
+            require(chunkSamples % hubertSubLen == 0) {
+                "embedder.staticAudioLen=$hubertSubLen must divide chunkSamples=$chunkSamples " +
+                    "(static HuBERT compiled at a length the synth chunk isn't a multiple of)"
+            }
+            hubertCallsPerChunk = chunkSamples / hubertSubLen
+        } else {
+            hubertSubLen = 0
+            hubertCallsPerChunk = 0
+        }
 
         Log.i(
             TAG,
-            "convertStaticChunked: T=$staticT, chunkSamples=$chunkSamples, audio padded ${originalLen}→${paddedLen}",
+            "convertStaticChunked: T=$staticT, chunkSamples=$chunkSamples, " +
+                "audio padded ${originalLen}→${paddedLen}, numChunks=$numChunks, " +
+                "perChunkHubert=$perChunkHubert (subLen=$hubertSubLen, " +
+                "$hubertCallsPerChunk calls/chunk)",
         )
 
-        val emb = embedder.extract(padded)
-        val totalFrames2x = emb.frames * 2
-        val feats2x = upsample2xNearest(emb.feats, emb.frames, emb.channels)
-        val numChunks = (totalFrames2x + staticT - 1) / staticT
-        onProgress(0.4f)
-
+        // Upfront RMVPE — runs on the full padded audio for both paths
+        // since pitch frames are cheap to slice per chunk.
         val pitch = if (metadata.f0) {
             requireNotNull(pitchExtractor) { "f0 model requires pitch extractor" }
             pitchExtractor.extract(padded, f0UpKey)
         } else null
-        onProgress(0.55f)
+        onProgress(0.2f)
 
-        Log.d(
-            TAG,
-            "  upfront: feats[$totalFrames2x, ${emb.channels}] pitch[${pitch?.pitchf?.size ?: 0}] → $numChunks chunks",
-        )
+        // Upfront HuBERT (ORT path) computes once on the full padded
+        // audio and we slice. QNN path defers to per-chunk extract().
+        var fullFeats2x: FloatArray? = null
+        var fullChannels = 0
+        var totalFrames2x = numChunks * staticT
+        if (!perChunkHubert) {
+            val emb = embedder.extract(padded)
+            fullChannels = emb.channels
+            fullFeats2x = upsample2xNearest(emb.feats, emb.frames, emb.channels)
+            totalFrames2x = emb.frames * 2
+            Log.d(
+                TAG,
+                "  upfront: feats[$totalFrames2x, $fullChannels] " +
+                    "pitch[${pitch?.pitchf?.size ?: 0}] → $numChunks chunks",
+            )
+            onProgress(0.55f)
+        }
 
         val parts = mutableListOf<FloatArray>()
         for (i in 0 until numChunks) {
             val frameStart = i * staticT
             val frameEnd = (frameStart + staticT).coerceAtMost(totalFrames2x)
-            val featsSlice = sliceFeatsToStaticT(feats2x, frameStart, frameEnd, staticT, emb.channels)
+
+            val featsSlice: FloatArray
+            val channels: Int
+            if (perChunkHubert) {
+                // staticAudioLen may be smaller than chunkSamples when
+                // the .bin was compiled at a length the V79 VTCM
+                // budget allowed (e.g. 5120 vs 30720). We make
+                // hubertCallsPerChunk runs and concat their frames so
+                // the synth still sees one staticT-sized window.
+                val subParts = ArrayList<EmbeddingData>(hubertCallsPerChunk)
+                for (s in 0 until hubertCallsPerChunk) {
+                    val subStart = i * chunkSamples + s * hubertSubLen
+                    val subAudio = padded.copyOfRange(subStart, subStart + hubertSubLen)
+                    subParts += embedder.extract(subAudio)
+                }
+                channels = subParts[0].channels
+                val totalFrames = subParts.sumOf { it.frames }
+                val combined = FloatArray(totalFrames * channels)
+                var off = 0
+                for (p in subParts) {
+                    System.arraycopy(p.feats, 0, combined, off, p.feats.size)
+                    off += p.feats.size
+                }
+                // 2x nearest upsample 50 Hz → 100 Hz. ContentVec's
+                // conv stack drops one frame per call to receptive
+                // field, so totalFrames is typically (numCalls × N) - 0
+                // and totalFrames × 2 may fall a few frames short of
+                // staticT (e.g. 6 × 15 = 90 → 180, vs staticT=192).
+                // sliceFeatsToStaticT handles this by replicating the
+                // last frame to fill — same handling the upfront path
+                // uses on its tail chunk.
+                val combined2x = upsample2xNearest(combined, totalFrames, channels)
+                featsSlice = sliceFeatsToStaticT(
+                    combined2x, 0, totalFrames * 2, staticT, channels,
+                )
+            } else {
+                channels = fullChannels
+                featsSlice = sliceFeatsToStaticT(
+                    fullFeats2x!!, frameStart, frameEnd, staticT, channels,
+                )
+            }
+
             val coarseSlice = pitch?.let { sliceLong(it.pitchCoarse, frameStart, frameEnd, staticT, fill = 1L) }
             val pitchfSlice = pitch?.let { sliceFloat(it.pitchf, frameStart, frameEnd, staticT, fill = 0f) }
 
             val synthOut = synthesizer.infer(
-                featsSlice, staticT, emb.channels, coarseSlice, pitchfSlice, sid,
+                featsSlice, staticT, channels, coarseSlice, pitchfSlice, sid,
             )
             parts += synthOut
             onProgress(0.55f + 0.43f * (i + 1) / numChunks)
@@ -379,116 +444,117 @@ object RvcPipelineFactory {
     private const val QNN_DEFAULT_T = 192
     private const val QNN_DEFAULT_INTER_CHANNELS = 192
 
+    // HuBERT QNN .bin compiled by tools/compile_hubert_aihub.py.
+    // We can't use chunkSamples=30720 directly: V79 has 8 MiB VTCM
+    // and the conv_layers.1 op alone needs ~48 MiB at that input
+    // length, so AI Hub compile fails. 5120 fits cleanly (chunkSamples
+    // = 6 × 5120) — the pipeline runs HuBERT 6× per synth chunk and
+    // concatenates the 16-frame outputs into the 96-frame block synth
+    // expects. Trade-off: HuBERT's transformer attention only sees
+    // 0.32 s of context per call instead of 1.92 s. Audible boundary
+    // artifacts haven't been a problem in tests so far.
+    private const val QNN_HUBERT_AUDIO_SAMPLES = 5120
+
     fun create(
         ctx: Context,
         modelUri: Uri,
         hubertUri: Uri,
         rmvpeUri: Uri?,
     ): RvcPipeline {
-        val displayName = queryDisplayName(ctx, modelUri)
-        val isQnnBinary = displayName.endsWith(".bin", ignoreCase = true)
-        Log.i(TAG, "factory: synth file '$displayName' → backend=${if (isQnnBinary) "QNN" else "ORT"}")
-        return if (isQnnBinary) createQnn(ctx, modelUri, hubertUri, rmvpeUri)
-        else createOnnx(ctx, modelUri, hubertUri, rmvpeUri)
-    }
+        val synthName = queryDisplayName(ctx, modelUri)
+        val hubertName = queryDisplayName(ctx, hubertUri)
+        val synthIsQnn = synthName.endsWith(".bin", ignoreCase = true)
+        val hubertIsQnn = hubertName.endsWith(".bin", ignoreCase = true)
+        Log.i(
+            TAG,
+            "factory: synth='$synthName' (${if (synthIsQnn) "QNN" else "ORT"}), " +
+                "hubert='$hubertName' (${if (hubertIsQnn) "QNN" else "ORT"})",
+        )
 
-    private fun createOnnx(
-        ctx: Context,
-        modelUri: Uri,
-        hubertUri: Uri,
-        rmvpeUri: Uri?,
-    ): RvcPipeline {
-        var synth: OrtSession? = null
-        var hubert: OrtSession? = null
-        var rmvpe: OrtSession? = null
+        var ortSynth: OrtSession? = null
+        var ortHubert: OrtSession? = null
+        var ortRmvpe: OrtSession? = null
+        var qnnSynth: QnnRvcSynthesizer? = null
+        var qnnHubert: QnnHubertEmbedder? = null
         try {
-            Log.i(TAG, "factory: loading synthesizer (ORT)")
-            synth = OrtRuntime.openSession(ctx, modelUri)
-            val metadata = ModelMetadata.fromSession(synth)
-                ?: error("synthesizer has no embedded metadata; export it via voice-changer")
-
-            Log.i(TAG, "factory: loading hubert")
-            hubert = OrtRuntime.openSession(ctx, hubertUri)
-            val hubertOutput = chooseHubertOutput(metadata)
-
-            if (metadata.f0) {
-                requireNotNull(rmvpeUri) { "f0 model selected but no rmvpe uri provided" }
-                Log.i(TAG, "factory: loading rmvpe")
-                rmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
+            // Pick a metadata source. ORT synth carries the embedded
+            // JSON; QNN synth has no ONNX to read so we fall back to
+            // the hardcoded constants and the QNN HuBERT will be
+            // expected to match (768-channel v2, layer 12).
+            val metadata: ModelMetadata
+            val synth: RvcSynth
+            if (synthIsQnn) {
+                metadata = ModelMetadata(
+                    samplingRate = QNN_DEFAULT_SR,
+                    f0 = true,
+                    embChannels = 768,
+                    embedder = "hubert_base",
+                    embOutputLayer = 12,
+                    useFinalProj = false,
+                    modelType = "QnnContextBinary",
+                    version = "static-1.0",
+                    staticT = QNN_DEFAULT_T,
+                )
+                Log.i(TAG, "factory: caching synth .bin")
+                val cachedBin = cacheBinUri(ctx, modelUri)
+                Log.i(TAG, "factory: loading QNN synthesizer from ${cachedBin.name}")
+                qnnSynth = QnnRvcSynthesizer(
+                    ctx = ctx,
+                    binPath = cachedBin.absolutePath,
+                    staticT = QNN_DEFAULT_T,
+                    interChannels = QNN_DEFAULT_INTER_CHANNELS,
+                    outputSampleRate = QNN_DEFAULT_SR,
+                )
+                synth = qnnSynth
+            } else {
+                Log.i(TAG, "factory: loading synthesizer (ORT)")
+                ortSynth = OrtRuntime.openSession(ctx, modelUri)
+                metadata = ModelMetadata.fromSession(ortSynth)
+                    ?: error("synthesizer has no embedded metadata; export it via voice-changer")
+                synth = RvcSynthesizer(
+                    session = ortSynth,
+                    hasF0 = metadata.f0,
+                    declaredStaticT = metadata.staticT,
+                )
             }
+
+            val embedder: HubertEmbedder
+            if (hubertIsQnn) {
+                Log.i(TAG, "factory: caching hubert .bin")
+                val cachedBin = cacheBinUri(ctx, hubertUri)
+                Log.i(TAG, "factory: loading QNN hubert from ${cachedBin.name}")
+                qnnHubert = QnnHubertEmbedder(
+                    ctx = ctx,
+                    binPath = cachedBin.absolutePath,
+                    staticAudioLen = QNN_HUBERT_AUDIO_SAMPLES,
+                )
+                embedder = qnnHubert
+            } else {
+                Log.i(TAG, "factory: loading hubert (ORT)")
+                ortHubert = OrtRuntime.openSession(ctx, hubertUri)
+                embedder = OrtHubertEmbedder(ortHubert, chooseHubertOutput(metadata))
+            }
+
+            val pitchExtractor = if (metadata.f0) {
+                requireNotNull(rmvpeUri) { "f0 model selected but no rmvpe uri provided" }
+                Log.i(TAG, "factory: loading rmvpe (ORT)")
+                ortRmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
+                RmvpePitchExtractor(ortRmvpe)
+            } else null
 
             return RvcPipeline(
                 metadata = metadata,
-                embedder = HubertEmbedder(hubert, hubertOutput),
-                pitchExtractor = rmvpe?.let { RmvpePitchExtractor(it) },
-                synthesizer = RvcSynthesizer(
-                    session = synth,
-                    hasF0 = metadata.f0,
-                    declaredStaticT = metadata.staticT,
-                ),
+                embedder = embedder,
+                pitchExtractor = pitchExtractor,
+                synthesizer = synth,
             )
         } catch (t: Throwable) {
             Log.e(TAG, "factory: aborting; closing partial sessions", t)
-            runCatching { synth?.close() }
-            runCatching { hubert?.close() }
-            runCatching { rmvpe?.close() }
-            throw t
-        }
-    }
-
-    private fun createQnn(
-        ctx: Context,
-        modelUri: Uri,
-        hubertUri: Uri,
-        rmvpeUri: Uri?,
-    ): RvcPipeline {
-        var hubert: OrtSession? = null
-        var rmvpe: OrtSession? = null
-        var qnnSynth: QnnRvcSynthesizer? = null
-        try {
-            // Synthetic metadata mirrors what the corresponding .onnx
-            // would have set; HuBERT/RMVPE branching uses these fields.
-            val metadata = ModelMetadata(
-                samplingRate = QNN_DEFAULT_SR,
-                f0 = true,
-                embChannels = 768,
-                embedder = "hubert_base",
-                embOutputLayer = 12,
-                useFinalProj = false,
-                modelType = "QnnContextBinary",
-                version = "static-1.0",
-                staticT = QNN_DEFAULT_T,
-            )
-
-            Log.i(TAG, "factory: caching QNN .bin")
-            val cachedBin = cacheBinUri(ctx, modelUri)
-            Log.i(TAG, "factory: loading QNN synthesizer from ${cachedBin.name}")
-            qnnSynth = QnnRvcSynthesizer(
-                ctx = ctx,
-                binPath = cachedBin.absolutePath,
-                staticT = QNN_DEFAULT_T,
-                interChannels = QNN_DEFAULT_INTER_CHANNELS,
-                outputSampleRate = QNN_DEFAULT_SR,
-            )
-
-            Log.i(TAG, "factory: loading hubert (ORT)")
-            hubert = OrtRuntime.openSession(ctx, hubertUri)
-
-            requireNotNull(rmvpeUri) { "QNN binary expects f0 — rmvpe required" }
-            Log.i(TAG, "factory: loading rmvpe (ORT)")
-            rmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
-
-            return RvcPipeline(
-                metadata = metadata,
-                embedder = HubertEmbedder(hubert, chooseHubertOutput(metadata)),
-                pitchExtractor = RmvpePitchExtractor(rmvpe),
-                synthesizer = qnnSynth,
-            )
-        } catch (t: Throwable) {
-            Log.e(TAG, "factory: QNN path aborting; closing partials", t)
             runCatching { qnnSynth?.close() }
-            runCatching { hubert?.close() }
-            runCatching { rmvpe?.close() }
+            runCatching { qnnHubert?.close() }
+            runCatching { ortSynth?.close() }
+            runCatching { ortHubert?.close() }
+            runCatching { ortRmvpe?.close() }
             throw t
         }
     }

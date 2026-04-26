@@ -460,6 +460,14 @@ bool QnnSynthRuntime::getOutput(const std::string& name, void* dst, size_t bytes
     return true;
 }
 
+const QnnTensorBinding* QnnSynthRuntime::inputBinding(size_t idx) const {
+    return idx < inputs_.size() ? &inputs_[idx] : nullptr;
+}
+
+const QnnTensorBinding* QnnSynthRuntime::outputBinding(size_t idx) const {
+    return idx < outputs_.size() ? &outputs_[idx] : nullptr;
+}
+
 bool QnnSynthRuntime::getOutputByIndex(size_t idx, void* dst, size_t bytes) const {
     if (idx >= outputs_.size()) {
         LOGE("getOutputByIndex: idx %zu >= numOutputs %zu", idx, outputs_.size());

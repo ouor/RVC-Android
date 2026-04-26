@@ -61,6 +61,14 @@ public:
     size_t numInputs() const { return inputs_.size(); }
     size_t numOutputs() const { return outputs_.size(); }
 
+    // Inspect a binding so the runner can size its host-side buffers
+    // off the .bin's actual schema instead of hardcoding shapes. We
+    // need this for HuBERT: the static-shape compile rounds output
+    // frames down by 1 (samples/320 - 1, not samples/320) and may
+    // emit fp32 even when activations were fp16.
+    const QnnTensorBinding* inputBinding(size_t idx) const;
+    const QnnTensorBinding* outputBinding(size_t idx) const;
+
     // Diagnostics for logcat dumps.
     std::string describe() const;
 
