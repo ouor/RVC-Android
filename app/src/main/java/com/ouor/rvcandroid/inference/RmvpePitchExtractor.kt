@@ -17,12 +17,29 @@ private val F0_MEL_MAX = 1127f * ln(1f + F0_MAX / 700f)
 
 class PitchData(val pitchf: FloatArray, val pitchCoarse: LongArray)
 
-class RmvpePitchExtractor(private val session: OrtSession) : Closeable {
+// Two backends share this interface: OrtRmvpePitchExtractor (CPU/NNAPI
+// via onnxruntime, accepts any audio length) and QnnRmvpePitchExtractor
+// (NPU via a spawned PIE runner, requires exactly staticAudioLen
+// samples per call). The pipeline branches on staticAudioLen to
+// decide between upfront extract on the full padded clip and per-
+// chunk extracts aligned with synth chunks.
+interface PitchExtractor : Closeable {
+    val staticAudioLen: Int?
+    fun extract(audio16k: FloatArray, f0UpKey: Int = 0, threshold: Float = 0.3f): PitchData
+}
 
-    fun extract(
+class OrtRmvpePitchExtractor(private val session: OrtSession) : PitchExtractor {
+
+    override val staticAudioLen: Int? = null
+
+    init {
+        Log.i(TAG, "init: backend=ORT")
+    }
+
+    override fun extract(
         audio16k: FloatArray,
-        f0UpKey: Int = 0,
-        threshold: Float = 0.3f,
+        f0UpKey: Int,
+        threshold: Float,
     ): PitchData {
         val tStart = System.nanoTime()
         val env = OrtRuntime.env
@@ -34,7 +51,7 @@ class RmvpePitchExtractor(private val session: OrtSession) : Closeable {
                     val tRan = System.nanoTime()
                     val pitchTensor = result.iterator().next().value as OnnxTensor
                     val raw = pitchTensor.copyFloats()
-                    val shifted = if (f0UpKey == 0) raw else shift(raw, f0UpKey)
+                    val shifted = if (f0UpKey == 0) raw else shiftPitch(raw, f0UpKey)
                     val coarse = melQuantize(shifted)
                     val tDone = System.nanoTime()
                     Log.i(
@@ -53,25 +70,25 @@ class RmvpePitchExtractor(private val session: OrtSession) : Closeable {
         Log.d(TAG, "close")
         session.close()
     }
+}
 
-    private fun shift(pitchf: FloatArray, semitones: Int): FloatArray {
-        val factor = 2.0.pow(semitones / 12.0).toFloat()
-        return FloatArray(pitchf.size) { pitchf[it] * factor }
-    }
+internal fun shiftPitch(pitchf: FloatArray, semitones: Int): FloatArray {
+    val factor = 2.0.pow(semitones / 12.0).toFloat()
+    return FloatArray(pitchf.size) { pitchf[it] * factor }
+}
 
-    // Match voice-changer's f0_coarse formula bit-for-bit so the synthesizer
-    // sees the same pitch-class indices it was trained against.
-    private fun melQuantize(pitchf: FloatArray): LongArray {
-        val span = F0_MEL_MAX - F0_MEL_MIN
-        val out = LongArray(pitchf.size)
-        for (i in pitchf.indices) {
-            val f = pitchf[i]
-            val scaled = if (f > 0f) {
-                val mel = 1127f * ln(1f + f / 700f)
-                if (mel > 0f) (mel - F0_MEL_MIN) * 254f / span + 1f else 1f
-            } else 1f
-            out[i] = scaled.coerceIn(1f, 255f).roundToInt().toLong()
-        }
-        return out
+// Match voice-changer's f0_coarse formula bit-for-bit so the synthesizer
+// sees the same pitch-class indices it was trained against.
+internal fun melQuantize(pitchf: FloatArray): LongArray {
+    val span = F0_MEL_MAX - F0_MEL_MIN
+    val out = LongArray(pitchf.size)
+    for (i in pitchf.indices) {
+        val f = pitchf[i]
+        val scaled = if (f > 0f) {
+            val mel = 1127f * ln(1f + f / 700f)
+            if (mel > 0f) (mel - F0_MEL_MIN) * 254f / span + 1f else 1f
+        } else 1f
+        out[i] = scaled.coerceIn(1f, 255f).roundToInt().toLong()
     }
+    return out
 }

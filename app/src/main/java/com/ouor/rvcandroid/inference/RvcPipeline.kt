@@ -14,7 +14,7 @@ private const val WINDOW = 160
 class RvcPipeline(
     val metadata: ModelMetadata,
     private val embedder: HubertEmbedder,
-    private val pitchExtractor: RmvpePitchExtractor?,
+    private val pitchExtractor: PitchExtractor?,
     private val synthesizer: RvcSynth,
 ) : Closeable {
 
@@ -183,17 +183,27 @@ class RvcPipeline(
             hubertCallsPerChunk = 0
         }
 
+        val perChunkRmvpe = pitchExtractor?.staticAudioLen != null
+        if (perChunkRmvpe) {
+            require(pitchExtractor!!.staticAudioLen == chunkSamples) {
+                "pitchExtractor.staticAudioLen=${pitchExtractor.staticAudioLen} != " +
+                    "chunkSamples=$chunkSamples (RMVPE .bin compiled at the wrong length)"
+            }
+        }
+
         Log.i(
             TAG,
             "convertStaticChunked: T=$staticT, chunkSamples=$chunkSamples, " +
                 "audio padded ${originalLen}→${paddedLen}, numChunks=$numChunks, " +
                 "perChunkHubert=$perChunkHubert (subLen=$hubertSubLen, " +
-                "$hubertCallsPerChunk calls/chunk)",
+                "$hubertCallsPerChunk calls/chunk), perChunkRmvpe=$perChunkRmvpe",
         )
 
-        // Upfront RMVPE — runs on the full padded audio for both paths
-        // since pitch frames are cheap to slice per chunk.
-        val pitch = if (metadata.f0) {
+        // Upfront RMVPE — runs once on the full padded audio when the
+        // ORT path is in play (CPU scales near-linearly so doing it
+        // once is fine). The QNN path defers to per-chunk extracts
+        // inside the loop because the .bin baked a fixed audio_samples.
+        val pitch = if (metadata.f0 && !perChunkRmvpe) {
             requireNotNull(pitchExtractor) { "f0 model requires pitch extractor" }
             pitchExtractor.extract(padded, f0UpKey)
         } else null
@@ -263,8 +273,21 @@ class RvcPipeline(
                 )
             }
 
-            val coarseSlice = pitch?.let { sliceLong(it.pitchCoarse, frameStart, frameEnd, staticT, fill = 1L) }
-            val pitchfSlice = pitch?.let { sliceFloat(it.pitchf, frameStart, frameEnd, staticT, fill = 0f) }
+            val coarseSlice: LongArray?
+            val pitchfSlice: FloatArray?
+            if (perChunkRmvpe) {
+                val chunkAudio = padded.copyOfRange(i * chunkSamples, (i + 1) * chunkSamples)
+                val chunkPitch = pitchExtractor!!.extract(chunkAudio, f0UpKey)
+                // QNN RMVPE returns exactly staticT frames per call,
+                // but we still go through the slicer so a short tail
+                // (rare; static-T → exact match) gets padded with the
+                // standard fill values rather than crashing on size.
+                coarseSlice = sliceLong(chunkPitch.pitchCoarse, 0, chunkPitch.pitchCoarse.size, staticT, fill = 1L)
+                pitchfSlice = sliceFloat(chunkPitch.pitchf, 0, chunkPitch.pitchf.size, staticT, fill = 0f)
+            } else {
+                coarseSlice = pitch?.let { sliceLong(it.pitchCoarse, frameStart, frameEnd, staticT, fill = 1L) }
+                pitchfSlice = pitch?.let { sliceFloat(it.pitchf, frameStart, frameEnd, staticT, fill = 0f) }
+            }
 
             val synthOut = synthesizer.infer(
                 featsSlice, staticT, channels, coarseSlice, pitchfSlice, sid,
@@ -463,12 +486,16 @@ object RvcPipelineFactory {
     ): RvcPipeline {
         val synthName = queryDisplayName(ctx, modelUri)
         val hubertName = queryDisplayName(ctx, hubertUri)
+        val rmvpeName = rmvpeUri?.let { queryDisplayName(ctx, it) }
         val synthIsQnn = synthName.endsWith(".bin", ignoreCase = true)
         val hubertIsQnn = hubertName.endsWith(".bin", ignoreCase = true)
+        val rmvpeIsQnn = rmvpeName?.endsWith(".bin", ignoreCase = true) == true
         Log.i(
             TAG,
             "factory: synth='$synthName' (${if (synthIsQnn) "QNN" else "ORT"}), " +
-                "hubert='$hubertName' (${if (hubertIsQnn) "QNN" else "ORT"})",
+                "hubert='$hubertName' (${if (hubertIsQnn) "QNN" else "ORT"}), " +
+                "rmvpe='${rmvpeName ?: "(none)"}' " +
+                "(${if (rmvpeName == null) "skip" else if (rmvpeIsQnn) "QNN" else "ORT"})",
         )
 
         var ortSynth: OrtSession? = null
@@ -476,6 +503,7 @@ object RvcPipelineFactory {
         var ortRmvpe: OrtSession? = null
         var qnnSynth: QnnRvcSynthesizer? = null
         var qnnHubert: QnnHubertEmbedder? = null
+        var qnnRmvpe: QnnRmvpePitchExtractor? = null
         try {
             // Pick a metadata source. ORT synth carries the embedded
             // JSON; QNN synth has no ONNX to read so we fall back to
@@ -535,11 +563,23 @@ object RvcPipelineFactory {
                 embedder = OrtHubertEmbedder(ortHubert, chooseHubertOutput(metadata))
             }
 
-            val pitchExtractor = if (metadata.f0) {
+            val pitchExtractor: PitchExtractor? = if (metadata.f0) {
                 requireNotNull(rmvpeUri) { "f0 model selected but no rmvpe uri provided" }
-                Log.i(TAG, "factory: loading rmvpe (ORT)")
-                ortRmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
-                RmvpePitchExtractor(ortRmvpe)
+                if (rmvpeIsQnn) {
+                    Log.i(TAG, "factory: caching rmvpe .bin")
+                    val cachedBin = cacheBinUri(ctx, rmvpeUri)
+                    Log.i(TAG, "factory: loading QNN rmvpe from ${cachedBin.name}")
+                    qnnRmvpe = QnnRmvpePitchExtractor(
+                        ctx = ctx,
+                        binPath = cachedBin.absolutePath,
+                        staticAudioLen = QNN_DEFAULT_T * 160,  // = chunkSamples
+                    )
+                    qnnRmvpe
+                } else {
+                    Log.i(TAG, "factory: loading rmvpe (ORT)")
+                    ortRmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
+                    OrtRmvpePitchExtractor(ortRmvpe)
+                }
             } else null
 
             return RvcPipeline(
@@ -552,6 +592,7 @@ object RvcPipelineFactory {
             Log.e(TAG, "factory: aborting; closing partial sessions", t)
             runCatching { qnnSynth?.close() }
             runCatching { qnnHubert?.close() }
+            runCatching { qnnRmvpe?.close() }
             runCatching { ortSynth?.close() }
             runCatching { ortHubert?.close() }
             runCatching { ortRmvpe?.close() }

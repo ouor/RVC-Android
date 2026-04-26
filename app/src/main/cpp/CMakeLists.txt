@@ -59,3 +59,4 @@ endfunction()
 
 add_qnn_runner(rvc_synth_runner  rvc_synth_runner_main.cpp)
 add_qnn_runner(rvc_hubert_runner rvc_hubert_runner_main.cpp)
+add_qnn_runner(rvc_rmvpe_runner  rvc_rmvpe_runner_main.cpp)
