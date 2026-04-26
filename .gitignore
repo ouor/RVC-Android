@@ -13,3 +13,15 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Local tooling
+.claude/
+
+# AI Hub conversion artifacts (large; reproducible from tools/*.py)
+/output/
+/qnn_build/
+
+# Vendored QNN SDK + skel (pulled by tools/pull_vendor_deps.sh on qnn branch)
+/app/src/main/cpp/3rdparty/
+/app/src/main/jniLibs/
+/app/src/main/assets/qnn_skel/
