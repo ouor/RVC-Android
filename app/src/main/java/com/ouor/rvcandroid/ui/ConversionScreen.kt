@@ -205,14 +205,48 @@ private fun OptionsCard(
     onF0Change: (Int) -> Unit,
     onSpeakerIdChange: (Long) -> Unit,
 ) {
+    // A non-default speaker id is meaningful, so force the section open in
+    // that case — otherwise the user could "lose" the value behind the toggle.
+    var manualOpen by rememberSaveable { mutableStateOf(false) }
+    val advancedOpen = manualOpen || speakerId != 0L
+
     ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             PitchShiftRow(value = f0UpKey, onChange = onF0Change)
-            SpeakerIdRow(value = speakerId, onChange = onSpeakerIdChange)
+
+            AdvancedToggle(
+                open = advancedOpen,
+                forced = speakerId != 0L,
+                onToggle = { manualOpen = !manualOpen },
+            )
+            AnimatedVisibility(advancedOpen) {
+                SpeakerIdRow(value = speakerId, onChange = onSpeakerIdChange)
+            }
         }
+    }
+}
+
+@Composable
+private fun AdvancedToggle(open: Boolean, forced: Boolean, onToggle: () -> Unit) {
+    val label = when {
+        forced -> "Advanced"
+        open -> "Hide advanced ▴"
+        else -> "Show advanced ▾"
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .let { if (forced) it else it.clickable(onClick = onToggle) },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -458,6 +492,7 @@ private fun FileStatusChip(
 
 @Composable
 private fun PitchShiftRow(value: Int, onChange: (Int) -> Unit) {
+    val signed = if (value > 0) "+$value" else value.toString()
     Column {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -465,7 +500,17 @@ private fun PitchShiftRow(value: Int, onChange: (Int) -> Unit) {
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Pitch shift", style = MaterialTheme.typography.labelLarge)
-            Text("$value semitones", style = MaterialTheme.typography.bodyMedium)
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                shape = MaterialTheme.shapes.small,
+            ) {
+                Text(
+                    text = "$signed semitones",
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+            }
         }
         Slider(
             value = value.toFloat(),
@@ -473,6 +518,18 @@ private fun PitchShiftRow(value: Int, onChange: (Int) -> Unit) {
             valueRange = -12f..12f,
             steps = 23,
         )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            val tickStyle = MaterialTheme.typography.labelSmall
+            val tickColor = MaterialTheme.colorScheme.onSurfaceVariant
+            Text("−12", style = tickStyle, color = tickColor)
+            Text("0", style = tickStyle, color = tickColor)
+            Text("+12", style = tickStyle, color = tickColor)
+        }
     }
 }
 
