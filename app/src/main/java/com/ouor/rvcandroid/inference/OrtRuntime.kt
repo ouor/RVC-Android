@@ -46,6 +46,20 @@ object OrtRuntime {
         nativeLibDir = ctx.applicationInfo.nativeLibraryDir
         Log.i(TAG, "ensureInitialized: nativeLibDir=$nativeLibDir")
         extractHexagonSkels(ctx)
+        // libcdsprpc.so is a transitive dependency of libQnnHtpV79Stub.so
+        // (Hexagon DSP RPC transport). It lives at /vendor/lib64/ and is
+        // not in our app's nativeLibraryDir, so System.loadLibrary can't
+        // resolve it by name. Loading it via absolute path brings it
+        // into our linker namespace before QnnHtp tries to open the V79
+        // stub. The <uses-native-library> entry in AndroidManifest is
+        // what permits this on API 30+.
+        for (vendorLib in listOf("/vendor/lib64/libcdsprpc.so")) {
+            runCatching { System.load(vendorLib) }
+                .onSuccess { Log.i(TAG, "ensureInitialized: preloaded $vendorLib") }
+                .onFailure { e ->
+                    Log.w(TAG, "ensureInitialized: System.load $vendorLib failed: ${e.message}")
+                }
+        }
         for (name in listOf("QnnSystem", "QnnHtp")) {
             runCatching { System.loadLibrary(name) }
                 .onSuccess { Log.i(TAG, "ensureInitialized: preloaded lib$name.so") }
@@ -57,7 +71,14 @@ object OrtRuntime {
     }
 
     private fun extractHexagonSkels(ctx: Context) {
-        val skelDir = File(ctx.filesDir, "qnn_skel").also { it.mkdirs() }
+        val skelDir = File(ctx.filesDir, "qnn_skel").also {
+            it.mkdirs()
+            // Permissive on the directory so the Hexagon DSP, which
+            // accesses files via fastrpc with its own uid/SELinux
+            // context, can stat and traverse it.
+            it.setReadable(true, /* ownerOnly = */ false)
+            it.setExecutable(true, false)
+        }
         val assetNames = ctx.assets.list("qnn_skel") ?: emptyArray()
         if (assetNames.isEmpty()) {
             Log.w(
@@ -67,26 +88,37 @@ object OrtRuntime {
         }
         for (name in assetNames) {
             val out = File(skelDir, name)
-            if (out.exists() && out.length() > 0) continue
-            Log.i(TAG, "extractHexagonSkels: $name → ${out.absolutePath}")
-            ctx.assets.open("qnn_skel/$name").use { input ->
-                out.outputStream().use { input.copyTo(it) }
+            if (!(out.exists() && out.length() > 0)) {
+                Log.i(TAG, "extractHexagonSkels: $name → ${out.absolutePath}")
+                ctx.assets.open("qnn_skel/$name").use { input ->
+                    out.outputStream().use { input.copyTo(it) }
+                }
             }
+            out.setReadable(true, /* ownerOnly = */ false)
         }
-        // Default ADSP search path varies by OEM, but /system/lib/rfsa/adsp +
-        // /vendor/lib/rfsa/adsp + /dsp covers what every Snapdragon Android
-        // device exposes. Prepending our extracted dir gets the QNN HTP
-        // driver to use OUR skel for V79 instead of any older system one.
-        val current = runCatching { System.getenv("ADSP_LIBRARY_PATH") }.getOrNull().orEmpty()
+
+        // Two env vars matter on modern Snapdragons: ADSP_LIBRARY_PATH
+        // for the legacy Hexagon NSP path, DSP_LIBRARY_PATH for the
+        // Compute DSP / HTP path. local-dream uses only the latter; we
+        // set both so we don't depend on which the V79 driver checks.
+        // The Hexagon side then dlopens libQnnHtpV79Skel.so along this
+        // path-list. /vendor/lib64/rfs/dsp/snap is included because
+        // Snapdragon 8 Elite ships a vendor-signed V79 skel there
+        // already — leaving the door open for the driver to fall back.
+        val current = runCatching { System.getenv("ADSP_LIBRARY_PATH") }
+            .getOrNull().orEmpty()
         val newPath = buildString {
             append(skelDir.absolutePath)
             append(';')
             if (current.isNotEmpty()) append(current).append(';')
-            append("/system/lib/rfsa/adsp;/vendor/lib/rfsa/adsp;/dsp")
+            append("/system/lib/rfsa/adsp;/vendor/lib/rfsa/adsp;")
+            append("/vendor/lib64/rfs/dsp/snap;/vendor/dsp;/dsp")
         }
-        runCatching { Os.setenv("ADSP_LIBRARY_PATH", newPath, true) }
-            .onSuccess { Log.i(TAG, "ADSP_LIBRARY_PATH=$newPath") }
-            .onFailure { e -> Log.w(TAG, "setenv ADSP_LIBRARY_PATH failed: ${e.message}") }
+        for (key in listOf("ADSP_LIBRARY_PATH", "DSP_LIBRARY_PATH")) {
+            runCatching { Os.setenv(key, newPath, true) }
+                .onSuccess { Log.i(TAG, "$key=$newPath") }
+                .onFailure { e -> Log.w(TAG, "setenv $key failed: ${e.message}") }
+        }
     }
 
     fun openSession(file: File): OrtSession {

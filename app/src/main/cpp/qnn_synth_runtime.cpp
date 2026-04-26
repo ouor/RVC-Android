@@ -7,6 +7,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "QNN/HTP/QnnHtpDevice.h"
+
 #define LOG_TAG "Rvc.QnnNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -117,6 +119,21 @@ bool QnnSynthRuntime::init(const std::string& binPath) {
 }
 
 bool QnnSynthRuntime::loadLibsAndInterfaces() {
+    // libQnnHtpV79Stub.so transitively depends on libcdsprpc.so. The
+    // /vendor/lib64/ copy isn't reachable from this process's linker
+    // namespace (permitted_paths excludes vendor lib dirs), so the
+    // setup script pulls libcdsprpc.so from the device into the app's
+    // jniLibs/arm64-v8a — there it's resolved via the namespace's
+    // ld_library_paths the same way our other bundled QNN libs are.
+    // Preloading with RTLD_GLOBAL puts it in the global symbol space
+    // before V79Stub's lazy dlopen tries to find it.
+    void* cdspHandle = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!cdspHandle) {
+        LOGW("dlopen libcdsprpc.so: %s (HTP device creation will fail)", dlerror());
+    } else {
+        LOGI("preloaded libcdsprpc.so");
+    }
+
     sysLib_ = dlopen("libQnnSystem.so", RTLD_NOW | RTLD_GLOBAL);
     if (!sysLib_) {
         LOGE("dlopen libQnnSystem.so: %s", dlerror());
@@ -173,8 +190,26 @@ bool QnnSynthRuntime::setupBackendAndDevice() {
         LOGE("backendCreate failed");
         return false;
     }
-    if (qnnApi_.deviceCreate(logHandle_, nullptr, &deviceHandle_) != QNN_SUCCESS) {
-        LOGE("deviceCreate failed");
+    // Unsigned-PD configuration. Without it the V79 driver tries to
+    // open a SIGNED process domain, which non-system apps can't enter
+    // — qnn_open returns 0x80000406 ("AEE_EBADCLASS") and CreateDevice
+    // fails. Setting useSignedProcessDomain=false routes the FastRPC
+    // session through the unsigned PD that consumer apps are allowed
+    // to use, and that's the only PD where our app-private skel
+    // (filesDir/qnn_skel/libQnnHtpV79Skel.so) is loadable from.
+    QnnHtpDevice_CustomConfig_t htpCustom = {};
+    htpCustom.option = QNN_HTP_DEVICE_CONFIG_OPTION_SIGNEDPD;
+    htpCustom.useSignedProcessDomain.deviceId = 0;
+    htpCustom.useSignedProcessDomain.useSignedProcessDomain = false;
+
+    QnnDevice_Config_t deviceCfg = {};
+    deviceCfg.option = QNN_DEVICE_CONFIG_OPTION_CUSTOM;
+    deviceCfg.customConfig = &htpCustom;
+
+    const QnnDevice_Config_t* configList[] = { &deviceCfg, nullptr };
+
+    if (qnnApi_.deviceCreate(logHandle_, configList, &deviceHandle_) != QNN_SUCCESS) {
+        LOGE("deviceCreate failed (unsigned PD)");
         return false;
     }
     return true;
@@ -422,6 +457,21 @@ bool QnnSynthRuntime::getOutput(const std::string& name, void* dst, size_t bytes
         return false;
     }
     std::memcpy(dst, b->buffer.data(), bytes);
+    return true;
+}
+
+bool QnnSynthRuntime::getOutputByIndex(size_t idx, void* dst, size_t bytes) const {
+    if (idx >= outputs_.size()) {
+        LOGE("getOutputByIndex: idx %zu >= numOutputs %zu", idx, outputs_.size());
+        return false;
+    }
+    const auto& b = outputs_[idx];
+    if (bytes != b.buffer.size()) {
+        LOGE("getOutputByIndex(%zu '%s'): %zu bytes asked for, %zu available",
+             idx, b.name.c_str(), bytes, b.buffer.size());
+        return false;
+    }
+    std::memcpy(dst, b.buffer.data(), bytes);
     return true;
 }
 

@@ -464,6 +464,7 @@ object RvcPipelineFactory {
             val cachedBin = cacheBinUri(ctx, modelUri)
             Log.i(TAG, "factory: loading QNN synthesizer from ${cachedBin.name}")
             qnnSynth = QnnRvcSynthesizer(
+                ctx = ctx,
                 binPath = cachedBin.absolutePath,
                 staticT = QNN_DEFAULT_T,
                 interChannels = QNN_DEFAULT_INTER_CHANNELS,

@@ -53,6 +53,10 @@ public:
     // verify and reject mismatches loudly rather than silently truncating.
     bool setInput(const std::string& name, const void* src, size_t bytes);
     bool getOutput(const std::string& name, void* dst, size_t bytes) const;
+    // AI Hub's qnn_context_binary compile renames graph outputs (e.g.
+    // 'audio' → 'output_0'), so going through index avoids us baking
+    // the post-compile name into the runner.
+    bool getOutputByIndex(size_t idx, void* dst, size_t bytes) const;
 
     size_t numInputs() const { return inputs_.size(); }
     size_t numOutputs() const { return outputs_.size(); }

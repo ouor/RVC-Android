@@ -12,6 +12,14 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.RVCAndroid">
+        <!-- libQnnHtpV79Stub.so transitively depends on libcdsprpc.so
+             (Compute DSP RPC), which lives at /vendor/lib64/ on
+             Snapdragon devices. Without this declaration the app's
+             linker namespace can't resolve it and QnnDevice_create
+             fails with "loadRemoteSymbols failed with err 4000". -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

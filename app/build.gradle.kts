@@ -74,6 +74,11 @@ android {
                 "lib/arm64-v8a/libQnnHtpV79Stub.so",
                 "lib/arm64-v8a/libQnnHtpPrepare.so",
             )
+            // librvc_synth_runner.so is a PIE executable, not a real
+            // library — we spawn it via ProcessBuilder. Android's
+            // packager will only extract it onto the filesystem (as
+            // required for execve) when legacy packaging is on.
+            useLegacyPackaging = true
         }
     }
 }
