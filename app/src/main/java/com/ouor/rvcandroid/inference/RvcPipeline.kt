@@ -50,8 +50,12 @@ class RvcPipeline(
         )
         onProgress(0f)
 
-        val out = if (audio16k.size <= tMax) convertSingle(audio16k, f0UpKey, speakerId, onProgress)
-        else convertChunked(audio16k, f0UpKey, speakerId, onProgress)
+        val staticT = synthesizer.staticT
+        val out = when {
+            staticT != null -> convertStaticChunked(audio16k, f0UpKey, speakerId, onProgress, staticT)
+            audio16k.size <= tMax -> convertSingle(audio16k, f0UpKey, speakerId, onProgress)
+            else -> convertChunked(audio16k, f0UpKey, speakerId, onProgress)
+        }
 
         Log.i(
             TAG,
@@ -137,6 +141,128 @@ class RvcPipeline(
         }
         onProgress(1f)
         return concat(parts)
+    }
+
+    // Static-T path: the synthesizer's T axis is pinned (e.g. 192). HuBERT
+    // and RMVPE run once on the full audio (zero-padded to a multiple of
+    // chunkSamples = staticT × WINDOW); their outputs are sliced into N
+    // synth calls of exactly staticT frames each. The final concat is
+    // trimmed back to the original duration so the appended zero-pad is
+    // discarded.
+    //
+    // Why upfront HuBERT/RMVPE rather than per-chunk: HuBERT's transformer
+    // attention sees the whole sequence at once, giving each output frame
+    // richer context than it would in a 1.92s window. RMVPE is a CNN+GRU
+    // and similarly benefits. Both scale near-linearly in length, so the
+    // upfront cost is no worse than the sum of per-chunk calls would be.
+    private fun convertStaticChunked(
+        audio: FloatArray,
+        f0UpKey: Int,
+        sid: Long,
+        onProgress: (Float) -> Unit,
+        staticT: Int,
+    ): FloatArray {
+        if (audio.isEmpty()) return FloatArray(0)
+
+        val chunkSamples = staticT * WINDOW
+        val originalLen = audio.size
+        val paddedLen = ((originalLen + chunkSamples - 1) / chunkSamples) * chunkSamples
+        val padded = if (paddedLen == originalLen) audio else FloatArray(paddedLen).also {
+            System.arraycopy(audio, 0, it, 0, originalLen)
+        }
+
+        Log.i(
+            TAG,
+            "convertStaticChunked: T=$staticT, chunkSamples=$chunkSamples, audio padded ${originalLen}→${paddedLen}",
+        )
+
+        val emb = embedder.extract(padded)
+        val totalFrames2x = emb.frames * 2
+        val feats2x = upsample2xNearest(emb.feats, emb.frames, emb.channels)
+        val numChunks = (totalFrames2x + staticT - 1) / staticT
+        onProgress(0.4f)
+
+        val pitch = if (metadata.f0) {
+            requireNotNull(pitchExtractor) { "f0 model requires pitch extractor" }
+            pitchExtractor.extract(padded, f0UpKey)
+        } else null
+        onProgress(0.55f)
+
+        Log.d(
+            TAG,
+            "  upfront: feats[$totalFrames2x, ${emb.channels}] pitch[${pitch?.pitchf?.size ?: 0}] → $numChunks chunks",
+        )
+
+        val parts = mutableListOf<FloatArray>()
+        for (i in 0 until numChunks) {
+            val frameStart = i * staticT
+            val frameEnd = (frameStart + staticT).coerceAtMost(totalFrames2x)
+            val featsSlice = sliceFeatsToStaticT(feats2x, frameStart, frameEnd, staticT, emb.channels)
+            val coarseSlice = pitch?.let { sliceLong(it.pitchCoarse, frameStart, frameEnd, staticT, fill = 1L) }
+            val pitchfSlice = pitch?.let { sliceFloat(it.pitchf, frameStart, frameEnd, staticT, fill = 0f) }
+
+            val synthOut = synthesizer.infer(
+                featsSlice, staticT, emb.channels, coarseSlice, pitchfSlice, sid,
+            )
+            parts += synthOut
+            onProgress(0.55f + 0.43f * (i + 1) / numChunks)
+        }
+
+        val concatenated = concat(parts)
+        val expectedTotalSamples = (originalLen.toLong() * metadata.samplingRate / SR).toInt()
+        onProgress(1f)
+        Log.d(
+            TAG,
+            "  concat: ${concatenated.size} samples → trim to $expectedTotalSamples (original duration)",
+        )
+        return if (concatenated.size > expectedTotalSamples) {
+            concatenated.copyOfRange(0, expectedTotalSamples)
+        } else concatenated
+    }
+
+    private fun sliceFeatsToStaticT(
+        feats2x: FloatArray,
+        frameStart: Int,
+        frameEnd: Int,
+        staticT: Int,
+        channels: Int,
+    ): FloatArray {
+        val valid = frameEnd - frameStart
+        if (valid == staticT) {
+            return feats2x.copyOfRange(frameStart * channels, frameEnd * channels)
+        }
+        // Tail chunk: copy what's there, replicate the last valid frame
+        // for the rest. Replicating beats zero-padding because zeros at
+        // feats input would confuse the synth's TextEncoder.
+        val out = FloatArray(staticT * channels)
+        System.arraycopy(feats2x, frameStart * channels, out, 0, valid * channels)
+        val lastFrameOff = (frameEnd - 1).coerceAtLeast(0) * channels
+        for (t in valid until staticT) {
+            System.arraycopy(feats2x, lastFrameOff, out, t * channels, channels)
+        }
+        return out
+    }
+
+    private fun sliceLong(arr: LongArray, frameStart: Int, frameEnd: Int, target: Int, fill: Long): LongArray {
+        val safeStart = frameStart.coerceAtMost(arr.size)
+        val safeEnd = frameEnd.coerceAtMost(arr.size)
+        val raw = arr.copyOfRange(safeStart, safeEnd)
+        if (raw.size == target) return raw
+        if (raw.size > target) return raw.copyOf(target)
+        val out = LongArray(target) { fill }
+        System.arraycopy(raw, 0, out, 0, raw.size)
+        return out
+    }
+
+    private fun sliceFloat(arr: FloatArray, frameStart: Int, frameEnd: Int, target: Int, fill: Float): FloatArray {
+        val safeStart = frameStart.coerceAtMost(arr.size)
+        val safeEnd = frameEnd.coerceAtMost(arr.size)
+        val raw = arr.copyOfRange(safeStart, safeEnd)
+        if (raw.size == target) return raw
+        if (raw.size > target) return raw.copyOf(target)
+        val out = FloatArray(target).also { it.fill(fill) }
+        System.arraycopy(raw, 0, out, 0, raw.size)
+        return out
     }
 
     private fun runStages(audio: FloatArray, pitch: PitchData?, sid: Long): FloatArray {
