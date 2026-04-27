@@ -153,7 +153,6 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 synthStatus = state.synthStatus,
                 hubertStatus = state.hubertStatus,
                 rmvpeStatus = state.rmvpeStatus,
-                requiresRmvpe = state.requiresRmvpe,
                 allLoaded = state.allRequiredModelsLoaded,
                 onPickModel = { pickModel.launch(arrayOf("*/*")) },
                 onPickHubert = { pickHubert.launch(arrayOf("*/*")) },
@@ -334,7 +333,6 @@ private fun ModelsCard(
     synthStatus: ModelLoadStatus,
     hubertStatus: ModelLoadStatus,
     rmvpeStatus: ModelLoadStatus,
-    requiresRmvpe: Boolean,
     allLoaded: Boolean,
     onPickModel: () -> Unit,
     onPickHubert: () -> Unit,
@@ -348,8 +346,7 @@ private fun ModelsCard(
         if (allLoaded) expanded = false
     }
 
-    val rmvpeLabel = if (requiresRmvpe) "RMVPE (.onnx) — required" else "RMVPE (.onnx) — optional"
-    val subtitle = subtitleFor(synthStatus, hubertStatus, rmvpeStatus, requiresRmvpe)
+    val subtitle = subtitleFor(synthStatus, hubertStatus, rmvpeStatus)
 
     ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column {
@@ -366,7 +363,7 @@ private fun ModelsCard(
                 ) {
                     ModelRow("Synthesizer (.onnx)", model?.displayName, synthStatus, onPickModel)
                     ModelRow("ContentVec / HuBERT (.onnx)", hubert?.displayName, hubertStatus, onPickHubert)
-                    ModelRow(rmvpeLabel, rmvpe?.displayName, rmvpeStatus, onPickRmvpe)
+                    ModelRow("RMVPE (.onnx)", rmvpe?.displayName, rmvpeStatus, onPickRmvpe)
                 }
             }
         }
@@ -377,13 +374,8 @@ private fun subtitleFor(
     synth: ModelLoadStatus,
     hubert: ModelLoadStatus,
     rmvpe: ModelLoadStatus,
-    requiresRmvpe: Boolean,
 ): String {
-    val statuses = buildList {
-        add(synth)
-        add(hubert)
-        if (requiresRmvpe) add(rmvpe)
-    }
+    val statuses = listOf(synth, hubert, rmvpe)
     val total = statuses.size
     val loaded = statuses.count { it is ModelLoadStatus.Loaded }
     val loading = statuses.count { it is ModelLoadStatus.Loading }
@@ -542,10 +534,12 @@ private fun OptionsCard(
     onSpeakerIdChange: (Long) -> Unit,
     onOutputFormatChange: (AudioFormat) -> Unit,
 ) {
-    // A non-default speaker id is meaningful, so force the section open in
-    // that case — otherwise the user could "lose" the value behind the toggle.
+    // A non-default speaker id or non-MP3 format is meaningful, so force
+    // the section open in that case — otherwise the user could "lose" the
+    // value behind the toggle.
     var manualOpen by rememberSaveable { mutableStateOf(false) }
-    val advancedOpen = manualOpen || speakerId != 0L
+    val nonDefaultAdvanced = speakerId != 0L || outputFormat != AudioFormat.MP3
+    val advancedOpen = manualOpen || nonDefaultAdvanced
 
     ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column(
@@ -554,15 +548,16 @@ private fun OptionsCard(
         ) {
             PitchShiftRow(value = f0UpKey, onChange = onF0Change)
 
-            OutputFormatRow(value = outputFormat, onChange = onOutputFormatChange)
-
             AdvancedToggle(
                 open = advancedOpen,
-                forced = speakerId != 0L,
+                forced = nonDefaultAdvanced,
                 onToggle = { manualOpen = !manualOpen },
             )
             AnimatedVisibility(advancedOpen) {
-                SpeakerIdRow(value = speakerId, onChange = onSpeakerIdChange)
+                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    OutputFormatRow(value = outputFormat, onChange = onOutputFormatChange)
+                    SpeakerIdRow(value = speakerId, onChange = onSpeakerIdChange)
+                }
             }
         }
     }

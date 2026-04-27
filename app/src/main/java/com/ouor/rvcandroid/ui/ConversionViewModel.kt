@@ -78,7 +78,7 @@ data class ConversionUiState(
     val hubert: FileSelection? = null,
     val rmvpe: FileSelection? = null,
     val input: FileSelection? = null,
-    val outputFormat: AudioFormat = AudioFormat.WAV,
+    val outputFormat: AudioFormat = AudioFormat.MP3,
     val inputError: String? = null,
     val inputWaveform: FloatArray? = null,
     val recording: RecordingState = RecordingState.Idle,
@@ -95,21 +95,10 @@ data class ConversionUiState(
     val history: List<HistoryEntry> = emptyList(),
     val showResultSheet: Boolean = false,
 ) {
-    /**
-     * Whether RMVPE is mandatory. Determined by the synthesizer's metadata
-     * once it has loaded; until then we don't yet know whether the user can
-     * skip RMVPE selection.
-     */
-    val requiresRmvpe: Boolean
-        get() = (synthStatus as? ModelLoadStatus.Loaded)?.summary?.f0 == true
-
     val allRequiredModelsLoaded: Boolean
-        get() {
-            if (synthStatus !is ModelLoadStatus.Loaded) return false
-            if (hubertStatus !is ModelLoadStatus.Loaded) return false
-            if (requiresRmvpe && rmvpeStatus !is ModelLoadStatus.Loaded) return false
-            return true
-        }
+        get() = synthStatus is ModelLoadStatus.Loaded &&
+            hubertStatus is ModelLoadStatus.Loaded &&
+            rmvpeStatus is ModelLoadStatus.Loaded
 
     /**
      * Why the convert button is disabled, surfaced to the user as a hint.
@@ -119,18 +108,16 @@ data class ConversionUiState(
         if (stage == Stage.RUNNING) return null
         if (model == null) return "Pick a synthesizer model"
         if (hubert == null) return "Pick a HuBERT / ContentVec model"
+        if (rmvpe == null) return "Pick an RMVPE model"
         if (synthStatus is ModelLoadStatus.Failed) return "Synthesizer failed: ${synthStatus.error}"
         if (hubertStatus is ModelLoadStatus.Failed) return "HuBERT failed: ${hubertStatus.error}"
         if (rmvpeStatus is ModelLoadStatus.Failed) return "RMVPE failed: ${rmvpeStatus.error}"
         if (synthStatus is ModelLoadStatus.Loading) return "Loading synthesizer…"
         if (hubertStatus is ModelLoadStatus.Loading) return "Loading HuBERT…"
+        if (rmvpeStatus is ModelLoadStatus.Loading) return "Loading RMVPE…"
         if (synthStatus is ModelLoadStatus.Empty) return "Waiting for synthesizer"
         if (hubertStatus is ModelLoadStatus.Empty) return "Waiting for HuBERT"
-        if (requiresRmvpe) {
-            if (rmvpe == null) return "f0 model needs RMVPE"
-            if (rmvpeStatus is ModelLoadStatus.Loading) return "Loading RMVPE…"
-            if (rmvpeStatus is ModelLoadStatus.Empty) return "Waiting for RMVPE"
-        }
+        if (rmvpeStatus is ModelLoadStatus.Empty) return "Waiting for RMVPE"
         if (input == null) return "Pick or record an input audio"
         return null
     }
