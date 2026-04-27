@@ -41,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import com.ouor.rvcandroid.audio.AudioFormat
+import com.ouor.rvcandroid.inference.ModelLoadStatus
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -124,6 +125,11 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 model = state.model,
                 hubert = state.hubert,
                 rmvpe = state.rmvpe,
+                synthStatus = state.synthStatus,
+                hubertStatus = state.hubertStatus,
+                rmvpeStatus = state.rmvpeStatus,
+                requiresRmvpe = state.requiresRmvpe,
+                allLoaded = state.allRequiredModelsLoaded,
                 onPickModel = { pickModel.launch(arrayOf("*/*")) },
                 onPickHubert = { pickHubert.launch(arrayOf("*/*")) },
                 onPickRmvpe = { pickRmvpe.launch(arrayOf("*/*")) },
@@ -161,27 +167,31 @@ private fun ModelsCard(
     model: FileSelection?,
     hubert: FileSelection?,
     rmvpe: FileSelection?,
+    synthStatus: ModelLoadStatus,
+    hubertStatus: ModelLoadStatus,
+    rmvpeStatus: ModelLoadStatus,
+    requiresRmvpe: Boolean,
+    allLoaded: Boolean,
     onPickModel: () -> Unit,
     onPickHubert: () -> Unit,
     onPickRmvpe: () -> Unit,
 ) {
-    // RMVPE is optional at the picker level (only required at runtime for f0
-    // models), so the auto-collapse trigger is "core models filled" — the
-    // user can still tap the header to re-expand and add RMVPE.
-    val coreFilled = model != null && hubert != null
+    // Collapse only after every required model has finished loading — that
+    // way the user can watch the load spinners advance without the card
+    // disappearing the moment they tap a file.
     var expanded by rememberSaveable { mutableStateOf(true) }
-    LaunchedEffect(coreFilled) {
-        if (coreFilled) expanded = false
+    LaunchedEffect(allLoaded) {
+        if (allLoaded) expanded = false
     }
 
-    val total = 3
-    val filled = listOf(model, hubert, rmvpe).count { it != null }
+    val rmvpeLabel = if (requiresRmvpe) "RMVPE (.onnx) — required" else "RMVPE (.onnx) — optional"
+    val subtitle = subtitleFor(synthStatus, hubertStatus, rmvpeStatus, requiresRmvpe)
 
     ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column {
             CardHeader(
                 title = "Models",
-                subtitle = "$filled / $total selected",
+                subtitle = subtitle,
                 expanded = expanded,
                 onToggle = { expanded = !expanded },
             )
@@ -190,13 +200,43 @@ private fun ModelsCard(
                     modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    FileRow("Synthesizer (.onnx)", model?.displayName, onPickModel)
-                    FileRow("ContentVec / HuBERT (.onnx)", hubert?.displayName, onPickHubert)
-                    FileRow("RMVPE (.onnx) — required for f0 models", rmvpe?.displayName, onPickRmvpe)
+                    ModelRow("Synthesizer (.onnx)", model?.displayName, synthStatus, onPickModel)
+                    ModelRow("ContentVec / HuBERT (.onnx)", hubert?.displayName, hubertStatus, onPickHubert)
+                    ModelRow(rmvpeLabel, rmvpe?.displayName, rmvpeStatus, onPickRmvpe)
                 }
             }
         }
     }
+}
+
+private fun subtitleFor(
+    synth: ModelLoadStatus,
+    hubert: ModelLoadStatus,
+    rmvpe: ModelLoadStatus,
+    requiresRmvpe: Boolean,
+): String {
+    val statuses = buildList {
+        add(synth)
+        add(hubert)
+        if (requiresRmvpe) add(rmvpe)
+    }
+    val total = statuses.size
+    val loaded = statuses.count { it is ModelLoadStatus.Loaded }
+    val loading = statuses.count { it is ModelLoadStatus.Loading }
+    val failed = statuses.count { it is ModelLoadStatus.Failed }
+    return when {
+        failed > 0 -> "$failed failed · $loaded / $total ready"
+        loading > 0 -> "Loading… $loaded / $total ready"
+        loaded == total -> "Ready · ${summaryFor(synth)}"
+        else -> "$loaded / $total ready"
+    }
+}
+
+private fun summaryFor(status: ModelLoadStatus): String {
+    val s = (status as? ModelLoadStatus.Loaded)?.summary ?: return ""
+    val rate = if (s.sampleRate >= 1000) "${s.sampleRate / 1000}kHz" else "${s.sampleRate}Hz"
+    val pitch = if (s.f0) "f0" else "no-f0"
+    return "$rate · $pitch · ${s.embChannels}d"
 }
 
 @Composable
@@ -517,6 +557,94 @@ private fun FileRow(
             )
         }
     }
+}
+
+@Composable
+private fun ModelRow(
+    label: String,
+    selection: String?,
+    status: ModelLoadStatus,
+    onPick: () -> Unit,
+) {
+    Column {
+        Text(text = label, style = MaterialTheme.typography.labelLarge)
+        Spacer(Modifier.height(6.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            FilledTonalButton(onClick = onPick) {
+                Text(if (selection == null) "Select" else "Change")
+            }
+            ModelStatusChip(
+                selection = selection,
+                status = status,
+                onClick = onPick,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        // Failed loads need a full-width line for the error message; the chip
+        // alone truncates it past a few words.
+        if (status is ModelLoadStatus.Failed) {
+            Text(
+                text = status.error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModelStatusChip(
+    selection: String?,
+    status: ModelLoadStatus,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val cs = MaterialTheme.colorScheme
+    val (containerColor, contentColor) = when (status) {
+        is ModelLoadStatus.Loaded -> cs.secondaryContainer to cs.onSecondaryContainer
+        is ModelLoadStatus.Failed -> cs.errorContainer to cs.onErrorContainer
+        else -> cs.surfaceVariant to cs.onSurfaceVariant
+    }
+    AssistChip(
+        onClick = onClick,
+        modifier = modifier,
+        label = {
+            Text(
+                text = selection ?: "Not selected",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        leadingIcon = {
+            when (status) {
+                ModelLoadStatus.Empty -> {}
+                ModelLoadStatus.Loading -> CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 1.5.dp,
+                    color = contentColor,
+                )
+                is ModelLoadStatus.Loaded -> Text(
+                    text = "✓",
+                    color = contentColor,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                is ModelLoadStatus.Failed -> Text(
+                    text = "✕",
+                    color = contentColor,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+        },
+        colors = AssistChipDefaults.assistChipColors(
+            containerColor = containerColor,
+            labelColor = contentColor,
+            leadingIconContentColor = contentColor,
+        ),
+    )
 }
 
 @Composable
