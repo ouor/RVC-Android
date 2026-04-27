@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -52,6 +53,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -138,6 +140,7 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 output = state.output,
                 outputFormat = state.outputFormat,
                 inputError = state.inputError,
+                inputWaveform = state.inputWaveform,
                 onPickInput = { pickInput.launch(arrayOf("audio/*")) },
                 onPickOutput = {
                     createOutput.launch(
@@ -244,6 +247,7 @@ private fun IoCard(
     output: FileSelection?,
     outputFormat: AudioFormat,
     inputError: String?,
+    inputWaveform: FloatArray?,
     onPickInput: () -> Unit,
     onPickOutput: () -> Unit,
 ) {
@@ -252,14 +256,24 @@ private fun IoCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            InputRow(input = input, error = inputError, onPick = onPickInput)
+            InputRow(
+                input = input,
+                error = inputError,
+                waveform = inputWaveform,
+                onPick = onPickInput,
+            )
             FileRow("Output (${outputFormat.displayName})", output?.displayName, onPickOutput)
         }
     }
 }
 
 @Composable
-private fun InputRow(input: FileSelection?, error: String?, onPick: () -> Unit) {
+private fun InputRow(
+    input: FileSelection?,
+    error: String?,
+    waveform: FloatArray?,
+    onPick: () -> Unit,
+) {
     Column {
         FileRow("Input audio", input?.displayName, onPick)
         input?.meta?.let { meta ->
@@ -270,12 +284,44 @@ private fun InputRow(input: FileSelection?, error: String?, onPick: () -> Unit) 
                 modifier = Modifier.padding(top = 4.dp),
             )
         }
+        if (input != null && waveform != null && waveform.isNotEmpty()) {
+            WaveformThumbnail(
+                buckets = waveform,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .padding(top = 6.dp),
+            )
+        }
         if (error != null) {
             Text(
                 text = error,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun WaveformThumbnail(buckets: FloatArray, modifier: Modifier = Modifier) {
+    val color = MaterialTheme.colorScheme.primary
+    Canvas(modifier = modifier) {
+        if (buckets.isEmpty()) return@Canvas
+        val bw = size.width / buckets.size
+        val barWidth = (bw * 0.7f).coerceAtLeast(1f)
+        val centerY = size.height / 2f
+        val maxBar = size.height
+        buckets.forEachIndexed { i, amp ->
+            // RMS thumbnails on quiet audio look like a flat line; lift the
+            // floor so silence still has a visible 1 px tick.
+            val h = (amp.coerceIn(0f, 1f) * maxBar).coerceAtLeast(1f)
+            drawLine(
+                color = color,
+                start = Offset(i * bw + bw / 2f, centerY - h / 2f),
+                end = Offset(i * bw + bw / 2f, centerY + h / 2f),
+                strokeWidth = barWidth,
             )
         }
     }

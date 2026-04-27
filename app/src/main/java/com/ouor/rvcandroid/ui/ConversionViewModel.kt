@@ -13,6 +13,7 @@ import com.ouor.rvcandroid.audio.AudioIo
 import com.ouor.rvcandroid.audio.AudioMeta
 import com.ouor.rvcandroid.audio.AudioMetaProbe
 import com.ouor.rvcandroid.audio.Resampler
+import com.ouor.rvcandroid.audio.Waveform
 import com.ouor.rvcandroid.inference.ModelLoadStatus
 import com.ouor.rvcandroid.inference.ModelMetadata
 import com.ouor.rvcandroid.inference.ModelSummary
@@ -52,6 +53,7 @@ data class ConversionUiState(
     val output: FileSelection? = null,
     val outputFormat: AudioFormat = AudioFormat.WAV,
     val inputError: String? = null,
+    val inputWaveform: FloatArray? = null,
     val f0UpKey: Int = 0,
     val speakerId: Long = 0L,
     val synthStatus: ModelLoadStatus = ModelLoadStatus.Empty,
@@ -136,13 +138,21 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(
                         input = null,
+                        inputWaveform = null,
                         inputError = "Input too long (${meta.durationMs / 1000}s). Max 60s.",
                     )
                 }
                 return@launch
             }
             _state.update {
-                it.copy(input = sel.copy(meta = meta), inputError = null)
+                it.copy(input = sel.copy(meta = meta), inputError = null, inputWaveform = null)
+            }
+            // Waveform generation actually decodes the file, so we kick it
+            // off only after the cheap probe accepted the input — avoids
+            // burning a full ffmpeg decode on a file we just rejected.
+            val wave = Waveform.generate(ctx, uri)
+            _state.update { st ->
+                if (st.input?.uri == uri) st.copy(inputWaveform = wave) else st
             }
         }
     }
