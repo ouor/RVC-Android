@@ -1,7 +1,10 @@
 package com.ouor.rvcandroid.ui
 
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
@@ -24,6 +27,8 @@ import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -35,6 +40,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
+import com.ouor.rvcandroid.audio.AudioFormat
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -69,7 +75,7 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? -> uri?.let(vm::setInput) }
     val createOutput = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("audio/wav")
+        CreateAudioDocument()
     ) { uri: Uri? -> uri?.let(vm::setOutput) }
 
     val canConvert = state.model != null &&
@@ -126,15 +132,25 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
             IoCard(
                 input = state.input,
                 output = state.output,
+                outputFormat = state.outputFormat,
                 onPickInput = { pickInput.launch(arrayOf("audio/*")) },
-                onPickOutput = { createOutput.launch("rvc-output.wav") },
+                onPickOutput = {
+                    createOutput.launch(
+                        CreateAudioDocumentRequest(
+                            mime = state.outputFormat.mime,
+                            filename = "rvc-output.${state.outputFormat.ext}",
+                        )
+                    )
+                },
             )
 
             OptionsCard(
                 f0UpKey = state.f0UpKey,
                 speakerId = state.speakerId,
+                outputFormat = state.outputFormat,
                 onF0Change = vm::setF0UpKey,
                 onSpeakerIdChange = vm::setSpeakerId,
+                onOutputFormatChange = vm::setOutputFormat,
             )
         }
     }
@@ -187,6 +203,7 @@ private fun ModelsCard(
 private fun IoCard(
     input: FileSelection?,
     output: FileSelection?,
+    outputFormat: AudioFormat,
     onPickInput: () -> Unit,
     onPickOutput: () -> Unit,
 ) {
@@ -195,8 +212,8 @@ private fun IoCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            FileRow("Input audio (.wav)", input?.displayName, onPickInput)
-            FileRow("Output destination", output?.displayName, onPickOutput)
+            FileRow("Input audio", input?.displayName, onPickInput)
+            FileRow("Output (${outputFormat.displayName})", output?.displayName, onPickOutput)
         }
     }
 }
@@ -205,8 +222,10 @@ private fun IoCard(
 private fun OptionsCard(
     f0UpKey: Int,
     speakerId: Long,
+    outputFormat: AudioFormat,
     onF0Change: (Int) -> Unit,
     onSpeakerIdChange: (Long) -> Unit,
+    onOutputFormatChange: (AudioFormat) -> Unit,
 ) {
     // A non-default speaker id is meaningful, so force the section open in
     // that case — otherwise the user could "lose" the value behind the toggle.
@@ -220,6 +239,8 @@ private fun OptionsCard(
         ) {
             PitchShiftRow(value = f0UpKey, onChange = onF0Change)
 
+            OutputFormatRow(value = outputFormat, onChange = onOutputFormatChange)
+
             AdvancedToggle(
                 open = advancedOpen,
                 forced = speakerId != 0L,
@@ -227,6 +248,37 @@ private fun OptionsCard(
             )
             AnimatedVisibility(advancedOpen) {
                 SpeakerIdRow(value = speakerId, onChange = onSpeakerIdChange)
+            }
+        }
+    }
+}
+
+@Composable
+private fun OutputFormatRow(value: AudioFormat, onChange: (AudioFormat) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Column {
+        Text("Output format", style = MaterialTheme.typography.labelLarge)
+        Spacer(Modifier.height(6.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            FilledTonalButton(onClick = { expanded = true }) {
+                Text("${value.displayName} (.${value.ext}) ▾")
+            }
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+            ) {
+                AudioFormat.entries.forEach { fmt ->
+                    DropdownMenuItem(
+                        text = { Text("${fmt.displayName} (.${fmt.ext})") },
+                        onClick = {
+                            onChange(fmt)
+                            expanded = false
+                        },
+                    )
+                }
             }
         }
     }
@@ -538,6 +590,26 @@ private fun PitchShiftRow(value: Int, onChange: (Int) -> Unit) {
             Text("+12", style = tickStyle, color = tickColor)
         }
     }
+}
+
+/**
+ * SAF CreateDocument with a per-launch MIME + filename. The standard
+ * [ActivityResultContracts.CreateDocument] bakes the MIME at construction,
+ * which can't react to a Compose state change like the output-format
+ * dropdown — this contract reads both at launch() time.
+ */
+private data class CreateAudioDocumentRequest(val mime: String, val filename: String)
+
+private class CreateAudioDocument :
+    ActivityResultContract<CreateAudioDocumentRequest, Uri?>() {
+    override fun createIntent(context: Context, input: CreateAudioDocumentRequest): Intent =
+        Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType(input.mime)
+            .putExtra(Intent.EXTRA_TITLE, input.filename)
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
+        intent.takeIf { resultCode == android.app.Activity.RESULT_OK }?.data
 }
 
 @Composable

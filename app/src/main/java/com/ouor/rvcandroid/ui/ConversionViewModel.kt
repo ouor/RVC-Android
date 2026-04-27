@@ -40,6 +40,7 @@ data class ConversionUiState(
     val rmvpe: FileSelection? = null,
     val input: FileSelection? = null,
     val output: FileSelection? = null,
+    val outputFormat: AudioFormat = AudioFormat.WAV,
     val f0UpKey: Int = 0,
     val speakerId: Long = 0L,
     val stage: Stage = Stage.IDLE,
@@ -63,6 +64,15 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     fun setOutput(uri: Uri) = _state.update { it.copy(output = resolve(uri)) }
     fun setF0UpKey(value: Int) = _state.update { it.copy(f0UpKey = value) }
     fun setSpeakerId(value: Long) = _state.update { it.copy(speakerId = value) }
+    fun setOutputFormat(format: AudioFormat) {
+        _state.update {
+            // Clearing the output Uri when the format changes prevents
+            // writing an MP3 payload into a `.wav` file the user picked
+            // before flipping the dropdown.
+            if (it.outputFormat == format) it
+            else it.copy(outputFormat = format, output = null)
+        }
+    }
 
     fun convert() {
         val s = _state.value
@@ -100,8 +110,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 )
 
                 _state.update { it.copy(runningStep = Step.WRITING) }
-                val outFormat = AudioFormat.detect(ctx, s.output.uri) ?: AudioFormat.WAV
-                AudioIo.encode(ctx, s.output.uri, outFormat, out, pipe.outputSampleRate)
+                AudioIo.encode(ctx, s.output.uri, s.outputFormat, out, pipe.outputSampleRate)
 
                 val elapsed = System.currentTimeMillis() - t0
                 Log.i(TAG, "convert: done in ${elapsed}ms")
