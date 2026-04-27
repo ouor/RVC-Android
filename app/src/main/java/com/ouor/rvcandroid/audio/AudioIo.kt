@@ -37,7 +37,7 @@ object AudioIo {
         Log.i(TAG, "encode: uri=$uri format=$format samples=${samples.size} sr=$sampleRate")
         when (format) {
             AudioFormat.WAV -> encodeWav(ctx, uri, samples, sampleRate)
-            else -> error("encoder for $format not yet implemented")
+            else -> FFmpegEncoder.encode(ctx, uri, format, samples, sampleRate)
         }
     }
 
