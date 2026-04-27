@@ -468,6 +468,17 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Reopen the result sheet for a saved entry. Differs from
+     * [loadHistoryEntry] in two ways: it raises the sheet, and it clears
+     * elapsedMs so the sheet doesn't claim "Took 3.2s" for a clip that was
+     * actually produced minutes ago.
+     */
+    fun openHistoryEntry(entry: HistoryEntry) {
+        loadHistoryEntry(entry)
+        _state.update { it.copy(elapsedMs = null, showResultSheet = true) }
+    }
+
+    /**
      * Copy the cached preview file into the user-picked SAF destination. The
      * cache file stays around so a subsequent "Save as…" — say, exporting
      * the same conversion to a second location — works without re-running

@@ -181,7 +181,7 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 HistoryCard(
                     entries = state.history,
                     activeFile = state.preview.file,
-                    onPlay = vm::loadHistoryEntry,
+                    onPlay = vm::openHistoryEntry,
                     onSaveAs = { entry ->
                         vm.loadHistoryEntry(entry)
                         saveAs.launch(
@@ -721,11 +721,18 @@ private fun ResultSheet(
                     style = MaterialTheme.typography.titleLarge,
                 )
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Conversion complete", style = MaterialTheme.typography.titleMedium)
-                    if (elapsedMs != null) {
+                    val title = if (elapsedMs != null) "Conversion complete" else "Saved conversion"
+                    Text(title, style = MaterialTheme.typography.titleMedium)
+                    val subtitle = buildString {
+                        if (elapsedMs != null) append("Took ${formatDuration(elapsedMs)}")
+                        preview.format?.let {
+                            if (isNotEmpty()) append(" · ")
+                            append(it.displayName)
+                        }
+                    }
+                    if (subtitle.isNotEmpty()) {
                         Text(
-                            text = "Took ${formatDuration(elapsedMs)}" +
-                                (preview.format?.let { " · ${it.displayName}" } ?: ""),
+                            text = subtitle,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -941,7 +948,7 @@ private fun HistoryRow(
                     .padding(top = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                FilledTonalButton(onClick = onPlay) { Text("Play") }
+                FilledTonalButton(onClick = onPlay) { Text("Open") }
                 OutlinedButton(onClick = onSaveAs) { Text("Save as") }
                 Spacer(Modifier.weight(1f))
                 IconButton(onClick = onDelete) {
