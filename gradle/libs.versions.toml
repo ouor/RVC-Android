@@ -13,6 +13,7 @@ lifecycle = "2.8.7"
 coroutines = "1.10.1"
 onnxruntime = "1.20.0"
 ffmpegKit = "6.0.1"
+media3 = "1.4.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -42,6 +43,9 @@ onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime
 # upstream (com.arthenica.ffmpegkit.*), so call sites stay identical.
 ffmpeg-kit-audio = { group = "io.github.maxrave-dev", name = "ffmpeg-kit-audio", version.ref = "ffmpegKit" }
 smart-exception-java = { group = "com.arthenica", name = "smart-exception-java", version = "0.2.1" }
+
+androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
+androidx-media3-common = { group = "androidx.media3", name = "media3-common", version.ref = "media3" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

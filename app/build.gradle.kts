@@ -72,6 +72,9 @@ dependencies {
     implementation(libs.ffmpeg.kit.audio)
     implementation(libs.smart.exception.java)
 
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.common)
+
     // Kept for the XML <application> theme parent (Theme.Material3.*).
     implementation(libs.material)
 
