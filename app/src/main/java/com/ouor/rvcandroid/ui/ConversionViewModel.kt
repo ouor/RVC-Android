@@ -7,8 +7,9 @@ import android.provider.OpenableColumns
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.ouor.rvcandroid.audio.AudioFormat
+import com.ouor.rvcandroid.audio.AudioIo
 import com.ouor.rvcandroid.audio.Resampler
-import com.ouor.rvcandroid.audio.WavIo
 import com.ouor.rvcandroid.inference.RvcPipeline
 import com.ouor.rvcandroid.inference.RvcPipelineFactory
 import kotlinx.coroutines.Dispatchers
@@ -88,10 +89,8 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 val pipe = obtainPipeline(ctx, s.model.uri, s.hubert.uri, s.rmvpe?.uri)
                 _state.update { it.copy(runningStep = Step.READING) }
 
-                val wav = ctx.contentResolver.openInputStream(s.input.uri)
-                    ?.use { WavIo.read(it) }
-                    ?: error("cannot read input")
-                val audio16k = Resampler.resample(wav.samples, wav.sampleRate, HUBERT_SAMPLE_RATE)
+                val src = AudioIo.decode(ctx, s.input.uri)
+                val audio16k = Resampler.resample(src.samples, src.sampleRate, HUBERT_SAMPLE_RATE)
                 _state.update { it.copy(runningStep = Step.CONVERTING) }
 
                 val out = pipe.convert(
@@ -101,9 +100,8 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 )
 
                 _state.update { it.copy(runningStep = Step.WRITING) }
-                ctx.contentResolver.openOutputStream(s.output.uri)
-                    ?.use { WavIo.write(it, out, pipe.outputSampleRate) }
-                    ?: error("cannot write output")
+                val outFormat = AudioFormat.detect(ctx, s.output.uri) ?: AudioFormat.WAV
+                AudioIo.encode(ctx, s.output.uri, outFormat, out, pipe.outputSampleRate)
 
                 val elapsed = System.currentTimeMillis() - t0
                 Log.i(TAG, "convert: done in ${elapsed}ms")

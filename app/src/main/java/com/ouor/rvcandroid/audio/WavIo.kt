@@ -8,22 +8,12 @@ import java.nio.ByteOrder
 
 private const val TAG = "Rvc.Wav"
 
-data class WavData(val samples: FloatArray, val sampleRate: Int) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is WavData) return false
-        return sampleRate == other.sampleRate && samples.contentEquals(other.samples)
-    }
-
-    override fun hashCode(): Int = 31 * sampleRate + samples.contentHashCode()
-}
-
 object WavIo {
     private const val FORMAT_PCM = 1
     private const val FORMAT_FLOAT = 3
     private const val FORMAT_EXTENSIBLE = 0xFFFE
 
-    fun read(input: InputStream): WavData {
+    fun read(input: InputStream): AudioData {
         val data = parse(input.readBytes())
         val durationMs = data.samples.size * 1000L / data.sampleRate
         Log.i(TAG, "read: ${data.samples.size} samples @ ${data.sampleRate}Hz (${durationMs}ms)")
@@ -35,7 +25,7 @@ object WavIo {
         output.write(encodePcm16Mono(samples, sampleRate))
     }
 
-    private fun parse(bytes: ByteArray): WavData {
+    private fun parse(bytes: ByteArray): AudioData {
         require(bytes.size >= 44) { "wav too small: ${bytes.size}" }
         require(bytes.matches(0, "RIFF")) { "not a RIFF file" }
         require(bytes.matches(8, "WAVE")) { "not a WAVE file" }
@@ -121,7 +111,7 @@ object WavIo {
             else -> error("unsupported wav: format=$format bits=$bitsPerSample")
         }
 
-        return WavData(samples, sampleRate)
+        return AudioData(samples, sampleRate)
     }
 
     private fun encodePcm16Mono(samples: FloatArray, sampleRate: Int): ByteArray {
