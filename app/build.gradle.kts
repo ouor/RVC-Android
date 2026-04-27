@@ -66,6 +66,12 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.onnxruntime.android)
 
+    // ffmpeg-kit-audio: lame (MP3 encode), libvorbis, opus, soxr +
+    // FFmpeg-native AAC/FLAC. Community-republished after upstream archival.
+    // arm64-v8a only via abiFilters; LGPL.
+    implementation(libs.ffmpeg.kit.audio)
+    implementation(libs.smart.exception.java)
+
     // Kept for the XML <application> theme parent (Theme.Material3.*).
     implementation(libs.material)
 

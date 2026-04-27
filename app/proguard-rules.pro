@@ -19,3 +19,7 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# ffmpeg-kit invokes native callbacks reflectively into these classes.
+-keep class com.arthenica.ffmpegkit.** { *; }
+-keep class com.arthenica.smartexception.** { *; }

@@ -12,6 +12,7 @@ composeBom = "2025.04.00"
 lifecycle = "2.8.7"
 coroutines = "1.10.1"
 onnxruntime = "1.20.0"
+ffmpegKit = "6.0.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -34,6 +35,13 @@ androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "l
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 
 onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
+
+# Community fork: arthenica's official binaries were pulled from Maven Central
+# in April 2025; maxrave-dev republished the audio-only variant (lame for MP3
+# encode, libvorbis, plus FFmpeg's built-in AAC/FLAC). Same Java package as
+# upstream (com.arthenica.ffmpegkit.*), so call sites stay identical.
+ffmpeg-kit-audio = { group = "io.github.maxrave-dev", name = "ffmpeg-kit-audio", version.ref = "ffmpegKit" }
+smart-exception-java = { group = "com.arthenica", name = "smart-exception-java", version = "0.2.1" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
