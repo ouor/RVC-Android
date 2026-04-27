@@ -112,9 +112,8 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
     val blockReason = state.convertBlockReason()
     val canConvert = blockReason == null && state.stage != Stage.RUNNING
 
-    val convertLabel = when {
-        state.stage == Stage.RUNNING -> "Converting…"
-        state.stage == Stage.DONE -> "Convert again"
+    val convertLabel = when (state.stage) {
+        Stage.RUNNING -> "Converting…"
         else -> "Convert"
     }
 
@@ -132,25 +131,11 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
             BottomConvertBar(
                 stage = state.stage,
                 runningStep = state.runningStep,
-                preview = state.preview,
-                elapsedMs = state.elapsedMs,
                 message = state.message,
-                outputFormat = state.outputFormat,
                 enabled = canConvert,
                 buttonLabel = convertLabel,
                 blockReason = blockReason,
                 onConvert = vm::convert,
-                onTogglePlay = vm::togglePlay,
-                onSeek = vm::seekTo,
-                onSaveAs = {
-                    val format = state.preview.format ?: state.outputFormat
-                    saveAs.launch(
-                        CreateAudioDocumentRequest(
-                            mime = format.mime,
-                            filename = "rvc-output.${format.ext}",
-                        )
-                    )
-                },
             )
         },
     ) { padding ->
@@ -219,6 +204,25 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
             amplitude = recording.amplitude,
             onStop = vm::stopRecording,
             onCancel = vm::cancelRecording,
+        )
+    }
+
+    if (state.showResultSheet && state.preview.file != null) {
+        ResultSheet(
+            preview = state.preview,
+            elapsedMs = state.elapsedMs,
+            onDismiss = vm::dismissResultSheet,
+            onTogglePlay = vm::togglePlay,
+            onSeek = vm::seekTo,
+            onSaveAs = {
+                val format = state.preview.format ?: state.outputFormat
+                saveAs.launch(
+                    CreateAudioDocumentRequest(
+                        mime = format.mime,
+                        filename = "rvc-output.${format.ext}",
+                    )
+                )
+            },
         )
     }
 
@@ -649,17 +653,11 @@ private fun CardHeader(
 private fun BottomConvertBar(
     stage: Stage,
     runningStep: Step?,
-    preview: PreviewState,
-    elapsedMs: Long?,
     message: String?,
-    outputFormat: AudioFormat,
     enabled: Boolean,
     buttonLabel: String,
     blockReason: String?,
     onConvert: () -> Unit,
-    onTogglePlay: () -> Unit,
-    onSeek: (Long) -> Unit,
-    onSaveAs: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
         Column(
@@ -674,70 +672,88 @@ private fun BottomConvertBar(
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     )
                 }
-                stage == Stage.DONE -> {
-                    ResultHeader(elapsedMs)
-                    if (preview.file != null) {
-                        PlayerControls(
-                            preview = preview,
-                            onTogglePlay = onTogglePlay,
-                            onSeek = onSeek,
-                        )
-                    }
-                }
                 stage == Stage.ERROR -> ErrorBanner(message)
                 blockReason != null -> BlockReasonBanner(blockReason)
                 else -> {}
             }
-            if (stage == Stage.DONE && preview.file != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    OutlinedButton(
-                        onClick = onSaveAs,
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Save as ${outputFormat.displayName}") }
-                    Button(
-                        onClick = onConvert,
-                        enabled = enabled,
-                        modifier = Modifier.weight(1f),
-                    ) { Text(buttonLabel) }
-                }
-            } else {
-                Button(
-                    onClick = onConvert,
-                    enabled = enabled,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                ) {
-                    Text(buttonLabel)
-                }
+            Button(
+                onClick = onConvert,
+                enabled = enabled,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+            ) {
+                Text(buttonLabel)
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ResultHeader(elapsedMs: Long?) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+private fun ResultSheet(
+    preview: PreviewState,
+    elapsedMs: Long?,
+    onDismiss: () -> Unit,
+    onTogglePlay: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onSaveAs: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
     ) {
-        Text("✓", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleMedium)
-        Text(
-            text = buildString {
-                append("Converted")
-                if (elapsedMs != null) append(" in ${formatDuration(elapsedMs)}")
-            },
-            color = MaterialTheme.colorScheme.primary,
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 8.dp)
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "✓",
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Conversion complete", style = MaterialTheme.typography.titleMedium)
+                    if (elapsedMs != null) {
+                        Text(
+                            text = "Took ${formatDuration(elapsedMs)}" +
+                                (preview.format?.let { " · ${it.displayName}" } ?: ""),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            PlayerControls(
+                preview = preview,
+                onTogglePlay = onTogglePlay,
+                onSeek = onSeek,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Close") }
+                Button(
+                    onClick = onSaveAs,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    val label = preview.format?.let { "Save as ${it.displayName}" } ?: "Save as…"
+                    Text(label)
+                }
+            }
+        }
     }
 }
 

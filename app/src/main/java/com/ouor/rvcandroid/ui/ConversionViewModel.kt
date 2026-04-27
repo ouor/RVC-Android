@@ -93,6 +93,7 @@ data class ConversionUiState(
     val message: String? = null,
     val preview: PreviewState = PreviewState(),
     val history: List<HistoryEntry> = emptyList(),
+    val showResultSheet: Boolean = false,
 ) {
     /**
      * Whether RMVPE is mandatory. Determined by the synthesizer's metadata
@@ -411,6 +412,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                             durationMs = 0L,
                         ),
                         history = HistoryCache.list(ctx),
+                        showResultSheet = true,
                     )
                 }
             } catch (t: Throwable) {
@@ -423,6 +425,19 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             }
+        }
+    }
+
+    fun dismissResultSheet() {
+        // Pause when the modal hides, otherwise the player keeps running
+        // with no controls visible.
+        if (player.isPlaying) player.pause()
+        _state.update { it.copy(showResultSheet = false) }
+    }
+
+    fun showResultSheet() {
+        if (_state.value.preview.file != null) {
+            _state.update { it.copy(showResultSheet = true) }
         }
     }
 
