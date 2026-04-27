@@ -69,11 +69,17 @@ class RvcPipeline(
         return audio
     }
 
+    /**
+     * Releases the per-pipeline wrappers but *not* the underlying ORT
+     * sessions — those are managed by the caller's session cache and may
+     * still be referenced by other consumers (e.g. a re-assembled pipeline
+     * after a single model swap).
+     *
+     * The legacy [create] entry point is the exception: it owns the
+     * sessions it just opened, so its catch block closes them on failure.
+     */
     override fun close() {
         Log.d(TAG, "close")
-        runCatching { embedder.close() }
-        runCatching { pitchExtractor?.close() }
-        runCatching { synthesizer.close() }
     }
 
     // HuBERT emits at ~50fps (one frame per 320 samples of 16 kHz audio); the
@@ -93,6 +99,31 @@ class RvcPipeline(
 }
 
 object RvcPipelineFactory {
+    /**
+     * Assemble a pipeline from already-opened ORT sessions. The caller owns
+     * the sessions — they are *not* closed by [RvcPipeline.close], because
+     * the ViewModel keeps them cached across conversions and across pipeline
+     * teardown when, say, only the speaker id changes.
+     */
+    fun assemble(
+        synthSession: OrtSession,
+        synthMetadata: ModelMetadata,
+        hubertSession: OrtSession,
+        rmvpeSession: OrtSession?,
+    ): RvcPipeline {
+        if (synthMetadata.f0) {
+            requireNotNull(rmvpeSession) { "f0 model selected but no rmvpe session provided" }
+        }
+        val hubertOutput = chooseHubertOutput(synthMetadata)
+        Log.i(TAG, "assemble: hubertOutput=$hubertOutput, f0=${synthMetadata.f0}")
+        return RvcPipeline(
+            metadata = synthMetadata,
+            embedder = HubertEmbedder(hubertSession, hubertOutput),
+            pitchExtractor = rmvpeSession?.let { RmvpePitchExtractor(it) },
+            synthesizer = RvcSynthesizer(synthSession, synthMetadata.f0),
+        )
+    }
+
     fun create(
         ctx: Context,
         modelUri: Uri,
@@ -110,7 +141,6 @@ object RvcPipelineFactory {
 
             Log.i(TAG, "factory: loading hubert")
             hubert = OrtRuntime.openSession(ctx, hubertUri)
-            val hubertOutput = chooseHubertOutput(metadata)
 
             if (metadata.f0) {
                 requireNotNull(rmvpeUri) { "f0 model selected but no rmvpe uri provided" }
@@ -118,12 +148,7 @@ object RvcPipelineFactory {
                 rmvpe = OrtRuntime.openSession(ctx, rmvpeUri)
             }
 
-            return RvcPipeline(
-                metadata = metadata,
-                embedder = HubertEmbedder(hubert, hubertOutput),
-                pitchExtractor = rmvpe?.let { RmvpePitchExtractor(it) },
-                synthesizer = RvcSynthesizer(synth, metadata.f0),
-            )
+            return assemble(synth, metadata, hubert, rmvpe)
         } catch (t: Throwable) {
             Log.e(TAG, "factory: aborting; closing partial sessions", t)
             runCatching { synth?.close() }

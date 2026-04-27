@@ -1,5 +1,6 @@
 package com.ouor.rvcandroid.ui
 
+import ai.onnxruntime.OrtSession
 import android.app.Application
 import android.content.Context
 import android.net.Uri
@@ -10,6 +11,10 @@ import androidx.lifecycle.viewModelScope
 import com.ouor.rvcandroid.audio.AudioFormat
 import com.ouor.rvcandroid.audio.AudioIo
 import com.ouor.rvcandroid.audio.Resampler
+import com.ouor.rvcandroid.inference.ModelLoadStatus
+import com.ouor.rvcandroid.inference.ModelMetadata
+import com.ouor.rvcandroid.inference.ModelSummary
+import com.ouor.rvcandroid.inference.OrtRuntime
 import com.ouor.rvcandroid.inference.RvcPipeline
 import com.ouor.rvcandroid.inference.RvcPipelineFactory
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +39,8 @@ enum class Step(val label: String) {
     WRITING("Write"),
 }
 
+private enum class Slot { SYNTH, HUBERT, RMVPE }
+
 data class ConversionUiState(
     val model: FileSelection? = null,
     val hubert: FileSelection? = null,
@@ -43,23 +50,76 @@ data class ConversionUiState(
     val outputFormat: AudioFormat = AudioFormat.WAV,
     val f0UpKey: Int = 0,
     val speakerId: Long = 0L,
+    val synthStatus: ModelLoadStatus = ModelLoadStatus.Empty,
+    val hubertStatus: ModelLoadStatus = ModelLoadStatus.Empty,
+    val rmvpeStatus: ModelLoadStatus = ModelLoadStatus.Empty,
     val stage: Stage = Stage.IDLE,
     val runningStep: Step? = null,
     val elapsedMs: Long? = null,
     val message: String? = null,
-)
+) {
+    /**
+     * Whether RMVPE is mandatory. Determined by the synthesizer's metadata
+     * once it has loaded; until then we don't yet know whether the user can
+     * skip RMVPE selection.
+     */
+    val requiresRmvpe: Boolean
+        get() = (synthStatus as? ModelLoadStatus.Loaded)?.summary?.f0 == true
+
+    val allRequiredModelsLoaded: Boolean
+        get() {
+            if (synthStatus !is ModelLoadStatus.Loaded) return false
+            if (hubertStatus !is ModelLoadStatus.Loaded) return false
+            if (requiresRmvpe && rmvpeStatus !is ModelLoadStatus.Loaded) return false
+            return true
+        }
+
+    /**
+     * Why the convert button is disabled, surfaced to the user as a hint.
+     * Returns null when convert is allowed.
+     */
+    fun convertBlockReason(): String? {
+        if (stage == Stage.RUNNING) return null
+        if (model == null) return "Pick a synthesizer model"
+        if (hubert == null) return "Pick a HuBERT / ContentVec model"
+        if (synthStatus is ModelLoadStatus.Failed) return "Synthesizer failed: ${synthStatus.error}"
+        if (hubertStatus is ModelLoadStatus.Failed) return "HuBERT failed: ${hubertStatus.error}"
+        if (rmvpeStatus is ModelLoadStatus.Failed) return "RMVPE failed: ${rmvpeStatus.error}"
+        if (synthStatus is ModelLoadStatus.Loading) return "Loading synthesizer…"
+        if (hubertStatus is ModelLoadStatus.Loading) return "Loading HuBERT…"
+        if (synthStatus is ModelLoadStatus.Empty) return "Waiting for synthesizer"
+        if (hubertStatus is ModelLoadStatus.Empty) return "Waiting for HuBERT"
+        if (requiresRmvpe) {
+            if (rmvpe == null) return "f0 model needs RMVPE"
+            if (rmvpeStatus is ModelLoadStatus.Loading) return "Loading RMVPE…"
+            if (rmvpeStatus is ModelLoadStatus.Empty) return "Waiting for RMVPE"
+        }
+        if (input == null) return "Pick an input audio file"
+        if (output == null) return "Pick an output destination"
+        return null
+    }
+}
 
 class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(ConversionUiState())
     val state = _state.asStateFlow()
 
+    /**
+     * ORT sessions kept warm so a pipeline assembly during convert is just
+     * wrapper construction, not another 5-second model open.
+     */
+    private val sessions = mutableMapOf<Slot, OrtSession>()
+    private val sessionUris = mutableMapOf<Slot, Uri>()
+    private val loadJobs = mutableMapOf<Slot, Job>()
+    private var synthMetadata: ModelMetadata? = null
+
     private var pipeline: RvcPipeline? = null
     private var pipelineKey: List<Uri?>? = null
-    private var job: Job? = null
+    private var convertJob: Job? = null
 
-    fun setModel(uri: Uri) = _state.update { it.copy(model = resolve(uri)) }
-    fun setHubert(uri: Uri) = _state.update { it.copy(hubert = resolve(uri)) }
-    fun setRmvpe(uri: Uri) = _state.update { it.copy(rmvpe = resolve(uri)) }
+    fun setModel(uri: Uri) = handleSlotSelection(Slot.SYNTH, uri)
+    fun setHubert(uri: Uri) = handleSlotSelection(Slot.HUBERT, uri)
+    fun setRmvpe(uri: Uri) = handleSlotSelection(Slot.RMVPE, uri)
     fun setInput(uri: Uri) = _state.update { it.copy(input = resolve(uri)) }
     fun setOutput(uri: Uri) = _state.update { it.copy(output = resolve(uri)) }
     fun setF0UpKey(value: Int) = _state.update { it.copy(f0UpKey = value) }
@@ -74,17 +134,65 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun handleSlotSelection(slot: Slot, uri: Uri) {
+        val sel = resolve(uri)
+        // Drop any cached pipeline that was assembled against the previous
+        // session — its wrappers reference an OrtSession we're about to close.
+        invalidatePipeline()
+        // Same Uri re-selected? Just update display state and skip the reload.
+        if (sessionUris[slot] == uri && sessions[slot] != null) {
+            _state.update { it.applySelection(slot, sel) }
+            return
+        }
+        loadJobs[slot]?.cancel()
+        loadJobs.remove(slot)
+        closeSession(slot)
+        if (slot == Slot.SYNTH) synthMetadata = null
+        _state.update { it.applySelection(slot, sel).withStatus(slot, ModelLoadStatus.Loading) }
+        startLoad(slot, sel)
+    }
+
+    private fun startLoad(slot: Slot, sel: FileSelection) {
+        val ctx: Context = getApplication()
+        loadJobs[slot] = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val session = OrtRuntime.openSession(ctx, sel.uri)
+                val summary: ModelSummary? = if (slot == Slot.SYNTH) {
+                    val meta = ModelMetadata.fromSession(session)
+                        ?: error("synth has no embedded metadata")
+                    synthMetadata = meta
+                    ModelSummary(
+                        sampleRate = meta.samplingRate,
+                        f0 = meta.f0,
+                        embedder = meta.embedder,
+                        embChannels = meta.embChannels,
+                    )
+                } else null
+                sessions[slot] = session
+                sessionUris[slot] = sel.uri
+                _state.update { it.withStatus(slot, ModelLoadStatus.Loaded(summary)) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "load $slot failed", t)
+                _state.update { it.withStatus(slot, ModelLoadStatus.Failed(t.message ?: "load failed")) }
+            } finally {
+                loadJobs.remove(slot)
+            }
+        }
+    }
+
     fun convert() {
         val s = _state.value
-        if (s.model == null || s.hubert == null || s.input == null || s.output == null) return
-        if (s.stage == Stage.RUNNING) return
+        if (s.convertBlockReason() != null) return
+        s as ConversionUiState
+        val input = s.input ?: return
+        val output = s.output ?: return
         val ctx: Context = getApplication()
-        job = viewModelScope.launch(Dispatchers.Default) {
+        convertJob = viewModelScope.launch(Dispatchers.Default) {
             val t0 = System.currentTimeMillis()
             Log.i(
                 TAG,
-                "convert: start model=${s.model.displayName} hubert=${s.hubert.displayName} " +
-                    "rmvpe=${s.rmvpe?.displayName ?: "-"} input=${s.input.displayName} " +
+                "convert: start model=${s.model?.displayName} hubert=${s.hubert?.displayName} " +
+                    "rmvpe=${s.rmvpe?.displayName ?: "-"} input=${input.displayName} " +
                     "f0UpKey=${s.f0UpKey} sid=${s.speakerId}",
             )
             _state.update {
@@ -96,10 +204,10 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             try {
-                val pipe = obtainPipeline(ctx, s.model.uri, s.hubert.uri, s.rmvpe?.uri)
+                val pipe = obtainPipeline()
                 _state.update { it.copy(runningStep = Step.READING) }
 
-                val src = AudioIo.decode(ctx, s.input.uri)
+                val src = AudioIo.decode(ctx, input.uri)
                 val audio16k = Resampler.resample(src.samples, src.sampleRate, HUBERT_SAMPLE_RATE)
                 _state.update { it.copy(runningStep = Step.CONVERTING) }
 
@@ -110,7 +218,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 )
 
                 _state.update { it.copy(runningStep = Step.WRITING) }
-                AudioIo.encode(ctx, s.output.uri, s.outputFormat, out, pipe.outputSampleRate)
+                AudioIo.encode(ctx, output.uri, s.outputFormat, out, pipe.outputSampleRate)
 
                 val elapsed = System.currentTimeMillis() - t0
                 Log.i(TAG, "convert: done in ${elapsed}ms")
@@ -135,39 +243,61 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun obtainPipeline(
-        ctx: Context,
-        model: Uri,
-        hubert: Uri,
-        rmvpe: Uri?,
-    ): RvcPipeline {
-        val key = listOf(model, hubert, rmvpe)
+    private suspend fun obtainPipeline(): RvcPipeline {
+        val synth = sessions[Slot.SYNTH] ?: error("synth session not loaded")
+        val hubert = sessions[Slot.HUBERT] ?: error("hubert session not loaded")
+        val rmvpe = sessions[Slot.RMVPE]
+        val meta = synthMetadata ?: error("synth metadata missing")
+        val key = listOf(sessionUris[Slot.SYNTH], sessionUris[Slot.HUBERT], sessionUris[Slot.RMVPE])
         val cached = pipeline
         if (cached != null && pipelineKey == key) {
             Log.d(TAG, "obtainPipeline: reusing cached pipeline")
             return cached
         }
-        Log.i(TAG, "obtainPipeline: building new pipeline")
-        cached?.let { runCatching { it.close() } }
-        pipeline = null
-        pipelineKey = null
-        val built = withContext(Dispatchers.IO) {
-            RvcPipelineFactory.create(ctx, model, hubert, rmvpe)
+        Log.i(TAG, "obtainPipeline: assembling from cached sessions")
+        val built = withContext(Dispatchers.Default) {
+            RvcPipelineFactory.assemble(synth, meta, hubert, rmvpe)
         }
         pipeline = built
         pipelineKey = key
         return built
     }
 
+    private fun invalidatePipeline() {
+        pipeline = null
+        pipelineKey = null
+    }
+
+    private fun closeSession(slot: Slot) {
+        sessions.remove(slot)?.let { runCatching { it.close() } }
+        sessionUris.remove(slot)
+    }
+
     override fun onCleared() {
         super.onCleared()
-        Log.d(TAG, "onCleared: closing pipeline")
-        pipeline?.let { runCatching { it.close() } }
-        pipeline = null
+        Log.d(TAG, "onCleared: closing sessions")
+        loadJobs.values.forEach { it.cancel() }
+        loadJobs.clear()
+        Slot.entries.forEach { closeSession(it) }
+        invalidatePipeline()
     }
 
     private fun resolve(uri: Uri): FileSelection =
         FileSelection(uri, queryDisplayName(getApplication(), uri))
+
+    private fun ConversionUiState.applySelection(slot: Slot, sel: FileSelection): ConversionUiState =
+        when (slot) {
+            Slot.SYNTH -> copy(model = sel)
+            Slot.HUBERT -> copy(hubert = sel)
+            Slot.RMVPE -> copy(rmvpe = sel)
+        }
+
+    private fun ConversionUiState.withStatus(slot: Slot, status: ModelLoadStatus): ConversionUiState =
+        when (slot) {
+            Slot.SYNTH -> copy(synthStatus = status)
+            Slot.HUBERT -> copy(hubertStatus = status)
+            Slot.RMVPE -> copy(rmvpeStatus = status)
+        }
 }
 
 private fun queryDisplayName(ctx: Context, uri: Uri): String {
