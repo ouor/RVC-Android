@@ -17,8 +17,13 @@ object AudioIo {
         val format = AudioFormat.detect(ctx, uri)
         Log.i(TAG, "decode: uri=$uri format=$format")
         return when (format) {
-            AudioFormat.WAV, null -> decodeWav(ctx, uri)
-            else -> error("decoder for $format not yet implemented")
+            AudioFormat.WAV -> decodeWav(ctx, uri)
+            null -> {
+                // Unknown extension/MIME — try ffmpeg's autodetection, which
+                // covers the long tail (e.g. raw AAC streams, exotic OGG).
+                FFmpegDecoder.decode(ctx, uri)
+            }
+            else -> FFmpegDecoder.decode(ctx, uri)
         }
     }
 
