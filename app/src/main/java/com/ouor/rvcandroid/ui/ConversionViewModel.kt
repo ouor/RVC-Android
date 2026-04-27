@@ -12,8 +12,11 @@ import com.ouor.rvcandroid.audio.AudioFormat
 import com.ouor.rvcandroid.audio.AudioIo
 import com.ouor.rvcandroid.audio.AudioMeta
 import com.ouor.rvcandroid.audio.AudioMetaProbe
+import com.ouor.rvcandroid.audio.PcmRecorder
 import com.ouor.rvcandroid.audio.Resampler
 import com.ouor.rvcandroid.audio.Waveform
+import androidx.core.net.toUri
+import java.io.File
 import com.ouor.rvcandroid.inference.ModelLoadStatus
 import com.ouor.rvcandroid.inference.ModelMetadata
 import com.ouor.rvcandroid.inference.ModelSummary
@@ -22,15 +25,18 @@ import com.ouor.rvcandroid.inference.RvcPipeline
 import com.ouor.rvcandroid.inference.RvcPipelineFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val TAG = "Rvc.Conv"
 private const val HUBERT_SAMPLE_RATE = 16000
 private const val MAX_INPUT_DURATION_MS = 60_000L
+private const val RECORDING_AMPLITUDE_POLL_MS = 50L
 
 data class FileSelection(val uri: Uri, val displayName: String, val meta: AudioMeta? = null)
 
@@ -45,6 +51,11 @@ enum class Step(val label: String) {
 
 private enum class Slot { SYNTH, HUBERT, RMVPE }
 
+sealed class RecordingState {
+    object Idle : RecordingState()
+    data class Active(val elapsedMs: Long, val amplitude: Float) : RecordingState()
+}
+
 data class ConversionUiState(
     val model: FileSelection? = null,
     val hubert: FileSelection? = null,
@@ -54,6 +65,7 @@ data class ConversionUiState(
     val outputFormat: AudioFormat = AudioFormat.WAV,
     val inputError: String? = null,
     val inputWaveform: FloatArray? = null,
+    val recording: RecordingState = RecordingState.Idle,
     val f0UpKey: Int = 0,
     val speakerId: Long = 0L,
     val synthStatus: ModelLoadStatus = ModelLoadStatus.Empty,
@@ -122,6 +134,10 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     private var pipeline: RvcPipeline? = null
     private var pipelineKey: List<Uri?>? = null
     private var convertJob: Job? = null
+
+    private var recorder: PcmRecorder? = null
+    private var recorderJob: Job? = null
+    private var recorderFile: File? = null
 
     fun setModel(uri: Uri) = handleSlotSelection(Slot.SYNTH, uri)
     fun setHubert(uri: Uri) = handleSlotSelection(Slot.HUBERT, uri)
@@ -213,6 +229,73 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 loadJobs.remove(slot)
             }
         }
+    }
+
+    /**
+     * Begin a 44.1 kHz mono mic capture into the app cacheDir. Caller is
+     * required to have RECORD_AUDIO granted before invoking — the
+     * permission flow lives in the Compose layer where it can show the
+     * Settings rationale.
+     */
+    fun startRecording() {
+        if (recorder != null) return
+        val ctx: Context = getApplication()
+        val dir = File(ctx.cacheDir, "recordings").apply { mkdirs() }
+        val file = File(dir, "rec_${System.currentTimeMillis()}.wav")
+        val rec = PcmRecorder()
+        try {
+            rec.start(file)
+        } catch (t: Throwable) {
+            Log.e(TAG, "startRecording failed", t)
+            _state.update { it.copy(inputError = "Recording failed: ${t.message}") }
+            return
+        }
+        recorder = rec
+        recorderFile = file
+        _state.update { it.copy(recording = RecordingState.Active(0L, 0f), inputError = null) }
+        val startedAt = System.currentTimeMillis()
+        recorderJob = viewModelScope.launch(Dispatchers.Default) {
+            while (isActive && rec.isRecording) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                _state.update {
+                    val cur = it.recording
+                    if (cur is RecordingState.Active) it.copy(
+                        recording = cur.copy(elapsedMs = elapsed, amplitude = rec.currentAmplitude),
+                    ) else it
+                }
+                if (elapsed >= MAX_INPUT_DURATION_MS) {
+                    stopRecording()
+                    break
+                }
+                delay(RECORDING_AMPLITUDE_POLL_MS)
+            }
+        }
+    }
+
+    fun stopRecording() {
+        val rec = recorder ?: return
+        recorder = null
+        recorderJob?.cancel()
+        recorderJob = null
+        val file = runCatching { rec.stop() }.getOrNull()
+        _state.update { it.copy(recording = RecordingState.Idle) }
+        if (file != null) {
+            // Treat the recording exactly like a picked file so it goes
+            // through the same probe + waveform pipeline as user input.
+            setInput(file.toUri())
+        }
+        recorderFile = null
+    }
+
+    fun cancelRecording() {
+        val rec = recorder ?: return
+        recorder = null
+        recorderJob?.cancel()
+        recorderJob = null
+        runCatching { rec.stop() }
+        recorderFile?.let { runCatching { it.delete() } }
+        recorderFile = null
+        _state.update { it.copy(recording = RecordingState.Idle) }
     }
 
     fun convert() {
@@ -311,6 +394,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         Log.d(TAG, "onCleared: closing sessions")
+        cancelRecording()
         loadJobs.values.forEach { it.cancel() }
         loadJobs.clear()
         Slot.entries.forEach { closeSession(it) }

@@ -1,11 +1,15 @@
 package com.ouor.rvcandroid.ui
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
@@ -23,6 +27,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -33,14 +38,20 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeTopAppBar
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
 import com.ouor.rvcandroid.audio.AudioFormat
 import com.ouor.rvcandroid.inference.ModelLoadStatus
 import androidx.compose.runtime.Composable
@@ -55,6 +66,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -64,6 +76,21 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 @Composable
 fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
     val state by vm.state.collectAsState()
+    val ctx = LocalContext.current
+    var showPermissionRationale by rememberSaveable { mutableStateOf(false) }
+    val recordPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) vm.startRecording() else showPermissionRationale = true
+    }
+    val launchRecorder: () -> Unit = {
+        if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED) {
+            vm.startRecording()
+        } else {
+            recordPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     val pickModel = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -142,6 +169,7 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 inputError = state.inputError,
                 inputWaveform = state.inputWaveform,
                 onPickInput = { pickInput.launch(arrayOf("audio/*")) },
+                onRecord = launchRecorder,
                 onPickOutput = {
                     createOutput.launch(
                         CreateAudioDocumentRequest(
@@ -162,6 +190,115 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
             )
         }
     }
+
+    val recording = state.recording
+    if (recording is RecordingState.Active) {
+        RecordingSheet(
+            elapsedMs = recording.elapsedMs,
+            amplitude = recording.amplitude,
+            onStop = vm::stopRecording,
+            onCancel = vm::cancelRecording,
+        )
+    }
+
+    if (showPermissionRationale) {
+        PermissionRationaleDialog(
+            onDismiss = { showPermissionRationale = false },
+            onOpenSettings = {
+                showPermissionRationale = false
+                ctx.startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", ctx.packageName, null)
+                    }
+                )
+            },
+        )
+    }
+}
+
+@Composable
+private fun PermissionRationaleDialog(onDismiss: () -> Unit, onOpenSettings: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Microphone access") },
+        text = {
+            Text(
+                "RVC Android needs the microphone permission to record input audio. " +
+                    "Enable it in system settings to use the in-app recorder."
+            )
+        },
+        confirmButton = { TextButton(onClick = onOpenSettings) { Text("Open settings") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RecordingSheet(
+    elapsedMs: Long,
+    amplitude: Float,
+    onStop: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onCancel,
+        sheetState = sheetState,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("Recording", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = formatElapsed(elapsedMs),
+                style = MaterialTheme.typography.headlineMedium,
+            )
+            // Amplitude lives in [0..1]; LinearProgressIndicator maps that
+            // to a level meter without dragging in another graph library.
+            LinearProgressIndicator(
+                progress = { amplitude.coerceIn(0f, 1f) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp),
+            )
+            // Same 60-second cap that gates picked input.
+            LinearProgressIndicator(
+                progress = { (elapsedMs / 60_000f).coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.tertiary,
+            )
+            Text(
+                text = "Auto-stop at 60s",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Cancel") }
+                Button(
+                    onClick = onStop,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Stop") }
+            }
+        }
+    }
+}
+
+private fun formatElapsed(ms: Long): String {
+    val s = ms / 1000
+    val mm = s / 60
+    val ss = s % 60
+    val tenths = (ms % 1000) / 100
+    return "%d:%02d.%d".format(mm, ss, tenths)
 }
 
 @Composable
@@ -249,6 +386,7 @@ private fun IoCard(
     inputError: String?,
     inputWaveform: FloatArray?,
     onPickInput: () -> Unit,
+    onRecord: () -> Unit,
     onPickOutput: () -> Unit,
 ) {
     ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
@@ -261,6 +399,7 @@ private fun IoCard(
                 error = inputError,
                 waveform = inputWaveform,
                 onPick = onPickInput,
+                onRecord = onRecord,
             )
             FileRow("Output (${outputFormat.displayName})", output?.displayName, onPickOutput)
         }
@@ -273,9 +412,10 @@ private fun InputRow(
     error: String?,
     waveform: FloatArray?,
     onPick: () -> Unit,
+    onRecord: () -> Unit,
 ) {
     Column {
-        FileRow("Input audio", input?.displayName, onPick)
+        InputPickRow(input = input, onPick = onPick, onRecord = onRecord)
         input?.meta?.let { meta ->
             Text(
                 text = formatMeta(meta),
@@ -299,6 +439,37 @@ private fun InputRow(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun InputPickRow(
+    input: FileSelection?,
+    onPick: () -> Unit,
+    onRecord: () -> Unit,
+) {
+    Column {
+        Text("Input audio", style = MaterialTheme.typography.labelLarge)
+        Spacer(Modifier.height(6.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FilledTonalButton(onClick = onPick) {
+                Text(if (input == null) "Select" else "Change")
+            }
+            // Mic acts as an alternate "select" — picking a file or recording
+            // both end up in the same state slot, so we don't show two
+            // selection chips.
+            IconButton(onClick = onRecord) {
+                Text("●", color = MaterialTheme.colorScheme.error)
+            }
+            FileStatusChip(
+                selection = input?.displayName,
+                onClick = onPick,
+                modifier = Modifier.weight(1f),
             )
         }
     }
