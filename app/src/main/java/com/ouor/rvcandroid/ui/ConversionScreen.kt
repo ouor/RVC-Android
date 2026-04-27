@@ -79,11 +79,8 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
         CreateAudioDocument()
     ) { uri: Uri? -> uri?.let(vm::setOutput) }
 
-    val canConvert = state.model != null &&
-        state.hubert != null &&
-        state.input != null &&
-        state.output != null &&
-        state.stage != Stage.RUNNING
+    val blockReason = state.convertBlockReason()
+    val canConvert = blockReason == null && state.stage != Stage.RUNNING
 
     val convertLabel = when {
         state.stage == Stage.RUNNING -> "Converting…"
@@ -110,6 +107,7 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 message = state.message,
                 enabled = canConvert,
                 buttonLabel = convertLabel,
+                blockReason = blockReason,
                 onConvert = vm::convert,
             )
         },
@@ -383,6 +381,7 @@ private fun BottomConvertBar(
     message: String?,
     enabled: Boolean,
     buttonLabel: String,
+    blockReason: String?,
     onConvert: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
@@ -400,6 +399,10 @@ private fun BottomConvertBar(
                 }
                 stage == Stage.DONE -> ResultBanner(outputName, elapsedMs)
                 stage == Stage.ERROR -> ErrorBanner(message)
+                // Tell the user what's missing instead of just dimming the
+                // button — most "why is this disabled?" moments come from
+                // the model loads still running in the background.
+                blockReason != null -> BlockReasonBanner(blockReason)
                 else -> {}
             }
             Button(
@@ -413,6 +416,18 @@ private fun BottomConvertBar(
             }
         }
     }
+}
+
+@Composable
+private fun BlockReasonBanner(reason: String) {
+    Text(
+        text = reason,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+    )
 }
 
 @Composable
