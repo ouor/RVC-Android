@@ -12,10 +12,14 @@ import com.ouor.rvcandroid.audio.AudioFormat
 import com.ouor.rvcandroid.audio.AudioIo
 import com.ouor.rvcandroid.audio.AudioMeta
 import com.ouor.rvcandroid.audio.AudioMetaProbe
+import com.ouor.rvcandroid.audio.HistoryCache
+import com.ouor.rvcandroid.audio.HistoryEntry
 import com.ouor.rvcandroid.audio.PcmRecorder
+import com.ouor.rvcandroid.audio.PreviewPlayer
 import com.ouor.rvcandroid.audio.Resampler
 import com.ouor.rvcandroid.audio.Waveform
 import androidx.core.net.toUri
+import androidx.media3.common.Player
 import java.io.File
 import com.ouor.rvcandroid.inference.ModelLoadStatus
 import com.ouor.rvcandroid.inference.ModelMetadata
@@ -56,12 +60,24 @@ sealed class RecordingState {
     data class Active(val elapsedMs: Long, val amplitude: Float) : RecordingState()
 }
 
+/**
+ * Local-cache preview of the most recently converted clip. The file lives
+ * inside [HistoryCache] (so the LRU keeps it alive) and the player polls
+ * its position into [positionMs] for the UI scrubber.
+ */
+data class PreviewState(
+    val file: File? = null,
+    val format: AudioFormat? = null,
+    val isPlaying: Boolean = false,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+)
+
 data class ConversionUiState(
     val model: FileSelection? = null,
     val hubert: FileSelection? = null,
     val rmvpe: FileSelection? = null,
     val input: FileSelection? = null,
-    val output: FileSelection? = null,
     val outputFormat: AudioFormat = AudioFormat.WAV,
     val inputError: String? = null,
     val inputWaveform: FloatArray? = null,
@@ -75,6 +91,8 @@ data class ConversionUiState(
     val runningStep: Step? = null,
     val elapsedMs: Long? = null,
     val message: String? = null,
+    val preview: PreviewState = PreviewState(),
+    val history: List<HistoryEntry> = emptyList(),
 ) {
     /**
      * Whether RMVPE is mandatory. Determined by the synthesizer's metadata
@@ -112,8 +130,7 @@ data class ConversionUiState(
             if (rmvpeStatus is ModelLoadStatus.Loading) return "Loading RMVPE…"
             if (rmvpeStatus is ModelLoadStatus.Empty) return "Waiting for RMVPE"
         }
-        if (input == null) return "Pick an input audio file"
-        if (output == null) return "Pick an output destination"
+        if (input == null) return "Pick or record an input audio"
         return null
     }
 }
@@ -139,9 +156,48 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     private var recorderJob: Job? = null
     private var recorderFile: File? = null
 
+    private val player: PreviewPlayer by lazy {
+        val p = PreviewPlayer(getApplication())
+        p.addListener(playerListener)
+        p
+    }
+    private var playerPollJob: Job? = null
+    private val playerListener = object : Player.Listener {
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            _state.update { it.copy(preview = it.preview.copy(isPlaying = isPlaying)) }
+            if (isPlaying) startPlayerPoll() else playerPollJob?.cancel()
+        }
+        override fun onPlaybackStateChanged(state: Int) {
+            // STATE_READY = 3 — duration is finally known.
+            if (state == Player.STATE_READY) {
+                _state.update {
+                    it.copy(preview = it.preview.copy(durationMs = player.durationMs))
+                }
+            }
+        }
+    }
+
+    private fun startPlayerPoll() {
+        playerPollJob?.cancel()
+        playerPollJob = viewModelScope.launch {
+            while (player.isPlaying) {
+                _state.update {
+                    it.copy(preview = it.preview.copy(positionMs = player.positionMs))
+                }
+                delay(50L)
+            }
+        }
+    }
+
     fun setModel(uri: Uri) = handleSlotSelection(Slot.SYNTH, uri)
     fun setHubert(uri: Uri) = handleSlotSelection(Slot.HUBERT, uri)
     fun setRmvpe(uri: Uri) = handleSlotSelection(Slot.RMVPE, uri)
+    init {
+        // Surface whatever's already in the LRU on first compose so the
+        // history card is populated across process restarts.
+        refreshHistory()
+    }
+
     fun setInput(uri: Uri) {
         val ctx: Context = getApplication()
         val sel = resolve(uri)
@@ -172,17 +228,10 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
-    fun setOutput(uri: Uri) = _state.update { it.copy(output = resolve(uri)) }
     fun setF0UpKey(value: Int) = _state.update { it.copy(f0UpKey = value) }
     fun setSpeakerId(value: Long) = _state.update { it.copy(speakerId = value) }
     fun setOutputFormat(format: AudioFormat) {
-        _state.update {
-            // Clearing the output Uri when the format changes prevents
-            // writing an MP3 payload into a `.wav` file the user picked
-            // before flipping the dropdown.
-            if (it.outputFormat == format) it
-            else it.copy(outputFormat = format, output = null)
-        }
+        _state.update { it.copy(outputFormat = format) }
     }
 
     private fun handleSlotSelection(slot: Slot, uri: Uri) {
@@ -301,9 +350,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     fun convert() {
         val s = _state.value
         if (s.convertBlockReason() != null) return
-        s as ConversionUiState
         val input = s.input ?: return
-        val output = s.output ?: return
         val ctx: Context = getApplication()
         convertJob = viewModelScope.launch(Dispatchers.Default) {
             val t0 = System.currentTimeMillis()
@@ -311,7 +358,7 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 TAG,
                 "convert: start model=${s.model?.displayName} hubert=${s.hubert?.displayName} " +
                     "rmvpe=${s.rmvpe?.displayName ?: "-"} input=${input.displayName} " +
-                    "f0UpKey=${s.f0UpKey} sid=${s.speakerId}",
+                    "f0UpKey=${s.f0UpKey} sid=${s.speakerId} outFmt=${s.outputFormat}",
             )
             _state.update {
                 it.copy(
@@ -336,16 +383,34 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                 )
 
                 _state.update { it.copy(runningStep = Step.WRITING) }
-                AudioIo.encode(ctx, output.uri, s.outputFormat, out, pipe.outputSampleRate)
+                // Stage to a scratch file and copy into the history LRU; the
+                // user's "Save as…" later just copies from there to the SAF
+                // destination they pick.
+                val scratch = File(ctx.cacheDir, "convert_out.${s.outputFormat.ext}")
+                AudioIo.encodeToFile(scratch, s.outputFormat, out, pipe.outputSampleRate)
+                val baseName = input.displayName.substringBeforeLast('.', input.displayName)
+                val cached = HistoryCache.add(ctx, scratch, s.outputFormat, baseName)
+                runCatching { scratch.delete() }
 
                 val elapsed = System.currentTimeMillis() - t0
-                Log.i(TAG, "convert: done in ${elapsed}ms")
+                Log.i(TAG, "convert: done in ${elapsed}ms → ${cached.name}")
+
+                withContext(Dispatchers.Main) { player.load(cached) }
+
                 _state.update {
                     it.copy(
                         stage = Stage.DONE,
                         runningStep = null,
                         elapsedMs = elapsed,
                         message = null,
+                        preview = PreviewState(
+                            file = cached,
+                            format = s.outputFormat,
+                            isPlaying = false,
+                            positionMs = 0L,
+                            durationMs = 0L,
+                        ),
+                        history = HistoryCache.list(ctx),
                     )
                 }
             } catch (t: Throwable) {
@@ -358,6 +423,74 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             }
+        }
+    }
+
+    fun togglePlay() {
+        if (_state.value.preview.file == null) return
+        player.togglePlay()
+    }
+
+    fun seekTo(ms: Long) {
+        if (_state.value.preview.file == null) return
+        player.seekTo(ms)
+        _state.update { it.copy(preview = it.preview.copy(positionMs = ms)) }
+    }
+
+    fun loadHistoryEntry(entry: HistoryEntry) {
+        player.load(entry.file)
+        _state.update {
+            it.copy(
+                preview = PreviewState(
+                    file = entry.file,
+                    format = entry.format,
+                    isPlaying = false,
+                    positionMs = 0L,
+                    durationMs = 0L,
+                ),
+            )
+        }
+    }
+
+    /**
+     * Copy the cached preview file into the user-picked SAF destination. The
+     * cache file stays around so a subsequent "Save as…" — say, exporting
+     * the same conversion to a second location — works without re-running
+     * the pipeline. [HistoryCache] owns the eventual cleanup.
+     */
+    fun saveCurrentPreview(uri: Uri) {
+        val src = _state.value.preview.file ?: return
+        val ctx: Context = getApplication()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                ctx.contentResolver.openOutputStream(uri)?.use { sink ->
+                    src.inputStream().use { it.copyTo(sink) }
+                } ?: error("cannot open $uri")
+                Log.i(TAG, "saveCurrentPreview: copied ${src.name} → $uri")
+            } catch (t: Throwable) {
+                Log.e(TAG, "saveCurrentPreview failed", t)
+                _state.update { it.copy(message = "Save failed: ${t.message}") }
+            }
+        }
+    }
+
+    fun deleteHistoryEntry(entry: HistoryEntry) {
+        // If the user is currently previewing the entry they're deleting,
+        // tear down the player so we don't keep a dangling file handle.
+        val cur = _state.value.preview.file
+        if (cur == entry.file) {
+            player.stop()
+            _state.update { it.copy(preview = PreviewState()) }
+        }
+        HistoryCache.delete(entry)
+        refreshHistory()
+    }
+
+    fun refreshHistory() {
+        val ctx: Context = getApplication()
+        viewModelScope.launch(Dispatchers.IO) {
+            val list = HistoryCache.list(ctx)
+            _state.update { it.copy(history = list) }
         }
     }
 
@@ -395,6 +528,9 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
         Log.d(TAG, "onCleared: closing sessions")
         cancelRecording()
+        playerPollJob?.cancel()
+        runCatching { player.removeListener(playerListener) }
+        runCatching { player.release() }
         loadJobs.values.forEach { it.cancel() }
         loadJobs.clear()
         Slot.entries.forEach { closeSession(it) }

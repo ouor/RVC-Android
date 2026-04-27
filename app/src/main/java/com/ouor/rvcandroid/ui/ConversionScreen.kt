@@ -104,9 +104,9 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
     val pickInput = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? -> uri?.let(vm::setInput) }
-    val createOutput = rememberLauncherForActivityResult(
+    val saveAs = rememberLauncherForActivityResult(
         CreateAudioDocument()
-    ) { uri: Uri? -> uri?.let(vm::setOutput) }
+    ) { uri: Uri? -> uri?.let(vm::saveCurrentPreview) }
 
     val blockReason = state.convertBlockReason()
     val canConvert = blockReason == null && state.stage != Stage.RUNNING
@@ -131,13 +131,25 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
             BottomConvertBar(
                 stage = state.stage,
                 runningStep = state.runningStep,
-                outputName = state.output?.displayName,
+                preview = state.preview,
                 elapsedMs = state.elapsedMs,
                 message = state.message,
+                outputFormat = state.outputFormat,
                 enabled = canConvert,
                 buttonLabel = convertLabel,
                 blockReason = blockReason,
                 onConvert = vm::convert,
+                onTogglePlay = vm::togglePlay,
+                onSeek = vm::seekTo,
+                onSaveAs = {
+                    val format = state.preview.format ?: state.outputFormat
+                    saveAs.launch(
+                        CreateAudioDocumentRequest(
+                            mime = format.mime,
+                            filename = "rvc-output.${format.ext}",
+                        )
+                    )
+                },
             )
         },
     ) { padding ->
@@ -164,20 +176,10 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
 
             IoCard(
                 input = state.input,
-                output = state.output,
-                outputFormat = state.outputFormat,
                 inputError = state.inputError,
                 inputWaveform = state.inputWaveform,
                 onPickInput = { pickInput.launch(arrayOf("audio/*")) },
                 onRecord = launchRecorder,
-                onPickOutput = {
-                    createOutput.launch(
-                        CreateAudioDocumentRequest(
-                            mime = state.outputFormat.mime,
-                            filename = "rvc-output.${state.outputFormat.ext}",
-                        )
-                    )
-                },
             )
 
             OptionsCard(
@@ -381,13 +383,10 @@ private fun summaryFor(status: ModelLoadStatus): String {
 @Composable
 private fun IoCard(
     input: FileSelection?,
-    output: FileSelection?,
-    outputFormat: AudioFormat,
     inputError: String?,
     inputWaveform: FloatArray?,
     onPickInput: () -> Unit,
     onRecord: () -> Unit,
-    onPickOutput: () -> Unit,
 ) {
     ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
         Column(
@@ -401,7 +400,6 @@ private fun IoCard(
                 onPick = onPickInput,
                 onRecord = onRecord,
             )
-            FileRow("Output (${outputFormat.displayName})", output?.displayName, onPickOutput)
         }
     }
 }
@@ -632,13 +630,17 @@ private fun CardHeader(
 private fun BottomConvertBar(
     stage: Stage,
     runningStep: Step?,
-    outputName: String?,
+    preview: PreviewState,
     elapsedMs: Long?,
     message: String?,
+    outputFormat: AudioFormat,
     enabled: Boolean,
     buttonLabel: String,
     blockReason: String?,
     onConvert: () -> Unit,
+    onTogglePlay: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onSaveAs: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
         Column(
@@ -653,25 +655,108 @@ private fun BottomConvertBar(
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     )
                 }
-                stage == Stage.DONE -> ResultBanner(outputName, elapsedMs)
+                stage == Stage.DONE -> {
+                    ResultHeader(elapsedMs)
+                    if (preview.file != null) {
+                        PlayerControls(
+                            preview = preview,
+                            onTogglePlay = onTogglePlay,
+                            onSeek = onSeek,
+                        )
+                    }
+                }
                 stage == Stage.ERROR -> ErrorBanner(message)
-                // Tell the user what's missing instead of just dimming the
-                // button — most "why is this disabled?" moments come from
-                // the model loads still running in the background.
                 blockReason != null -> BlockReasonBanner(blockReason)
                 else -> {}
             }
-            Button(
-                onClick = onConvert,
-                enabled = enabled,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-            ) {
-                Text(buttonLabel)
+            if (stage == Stage.DONE && preview.file != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onSaveAs,
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Save as ${outputFormat.displayName}") }
+                    Button(
+                        onClick = onConvert,
+                        enabled = enabled,
+                        modifier = Modifier.weight(1f),
+                    ) { Text(buttonLabel) }
+                }
+            } else {
+                Button(
+                    onClick = onConvert,
+                    enabled = enabled,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                ) {
+                    Text(buttonLabel)
+                }
             }
         }
     }
+}
+
+@Composable
+private fun ResultHeader(elapsedMs: Long?) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("✓", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleMedium)
+        Text(
+            text = buildString {
+                append("Converted")
+                if (elapsedMs != null) append(" in ${formatDuration(elapsedMs)}")
+            },
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+}
+
+@Composable
+private fun PlayerControls(
+    preview: PreviewState,
+    onTogglePlay: () -> Unit,
+    onSeek: (Long) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        FilledTonalButton(onClick = onTogglePlay) {
+            Text(if (preview.isPlaying) "Pause" else "Play")
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            val duration = preview.durationMs.coerceAtLeast(1L)
+            Slider(
+                value = preview.positionMs.toFloat().coerceIn(0f, duration.toFloat()),
+                onValueChange = { onSeek(it.toLong()) },
+                valueRange = 0f..duration.toFloat(),
+            )
+            Text(
+                text = "${formatTime(preview.positionMs)} / ${formatTime(preview.durationMs)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private fun formatTime(ms: Long): String {
+    val s = ms / 1000
+    return "%d:%02d".format(s / 60, s % 60)
 }
 
 @Composable
@@ -747,43 +832,6 @@ private fun StepChip(step: Step, state: StepUiState, modifier: Modifier = Modifi
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-        }
-    }
-}
-
-@Composable
-private fun ResultBanner(outputName: String?, elapsedMs: Long?) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Text(
-            text = "✓",
-            color = MaterialTheme.colorScheme.primary,
-            style = MaterialTheme.typography.titleMedium,
-        )
-        Column(modifier = Modifier.weight(1f)) {
-            val headline = buildString {
-                append("Saved")
-                if (elapsedMs != null) append(" in ${formatDuration(elapsedMs)}")
-            }
-            Text(
-                text = headline,
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            outputName?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
         }
     }
 }

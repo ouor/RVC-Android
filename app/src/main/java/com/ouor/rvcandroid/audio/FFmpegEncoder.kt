@@ -28,27 +28,42 @@ object FFmpegEncoder {
         sampleRate: Int,
     ) {
         require(format != AudioFormat.WAV) { "use WavIo for WAV output" }
-
-        val pcm = SafCache.newScratchFile(ctx, "enc_in_", "f32le")
         val out = SafCache.newScratchFile(ctx, "enc_out_", format.ext)
         try {
+            encodeToFile(out, format, samples, sampleRate)
+            ctx.contentResolver.openOutputStream(uri)?.use { sink ->
+                out.inputStream().use { it.copyTo(sink) }
+            } ?: error("cannot open output uri: $uri")
+            Log.i(TAG, "encode: wrote ${out.length()} bytes as ${format.displayName} → $uri")
+        } finally {
+            SafCache.deleteQuietly(out)
+        }
+    }
+
+    /**
+     * Encode straight to a local [target] file. The PCM scratch is still
+     * needed because ffmpeg only reads from a path, but we skip the SAF
+     * round-trip the [encode] caller pays.
+     */
+    fun encodeToFile(
+        target: File,
+        format: AudioFormat,
+        samples: FloatArray,
+        sampleRate: Int,
+    ) {
+        require(format != AudioFormat.WAV) { "use WavIo for WAV output" }
+        val pcm = File.createTempFile("enc_in_", ".f32le", target.parentFile ?: target)
+        try {
             writeF32Le(pcm, samples)
-
-            val cmd = buildCommand(pcm.absolutePath, sampleRate, format, out.absolutePath)
-            Log.d(TAG, "encode cmd: $cmd")
-
+            val cmd = buildCommand(pcm.absolutePath, sampleRate, format, target.absolutePath)
+            Log.d(TAG, "encodeToFile cmd: $cmd")
             val session = FFmpegKit.execute(cmd)
             if (!ReturnCode.isSuccess(session.returnCode)) {
                 error("ffmpeg encode failed (rc=${session.returnCode}): ${session.allLogsAsString}")
             }
-
-            ctx.contentResolver.openOutputStream(uri)?.use { sink ->
-                out.inputStream().use { it.copyTo(sink) }
-            } ?: error("cannot open output uri: $uri")
-            Log.i(TAG, "encode: wrote ${out.length()} bytes as ${format.displayName}")
+            Log.i(TAG, "encodeToFile: wrote ${target.length()} bytes as ${format.displayName}")
         } finally {
-            SafCache.deleteQuietly(pcm)
-            SafCache.deleteQuietly(out)
+            runCatching { pcm.delete() }
         }
     }
 

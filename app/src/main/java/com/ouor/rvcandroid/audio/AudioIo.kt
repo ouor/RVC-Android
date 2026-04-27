@@ -3,6 +3,7 @@ package com.ouor.rvcandroid.audio
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import java.io.File
 
 private const val TAG = "Rvc.AudioIo"
 
@@ -38,6 +39,24 @@ object AudioIo {
         when (format) {
             AudioFormat.WAV -> encodeWav(ctx, uri, samples, sampleRate)
             else -> FFmpegEncoder.encode(ctx, uri, format, samples, sampleRate)
+        }
+    }
+
+    /**
+     * Convert + write straight to a local [file]. Used by the preview path
+     * so we don't have to round-trip through SAF when the destination is a
+     * temp cache file we picked ourselves.
+     */
+    fun encodeToFile(
+        file: File,
+        format: AudioFormat,
+        samples: FloatArray,
+        sampleRate: Int,
+    ) {
+        Log.i(TAG, "encodeToFile: $file format=$format samples=${samples.size} sr=$sampleRate")
+        when (format) {
+            AudioFormat.WAV -> file.outputStream().use { WavIo.write(it, samples, sampleRate) }
+            else -> FFmpegEncoder.encodeToFile(file, format, samples, sampleRate)
         }
     }
 
