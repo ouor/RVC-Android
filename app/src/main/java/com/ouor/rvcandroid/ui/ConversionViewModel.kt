@@ -10,6 +10,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ouor.rvcandroid.audio.AudioFormat
 import com.ouor.rvcandroid.audio.AudioIo
+import com.ouor.rvcandroid.audio.AudioMeta
+import com.ouor.rvcandroid.audio.AudioMetaProbe
 import com.ouor.rvcandroid.audio.Resampler
 import com.ouor.rvcandroid.inference.ModelLoadStatus
 import com.ouor.rvcandroid.inference.ModelMetadata
@@ -27,8 +29,9 @@ import kotlinx.coroutines.withContext
 
 private const val TAG = "Rvc.Conv"
 private const val HUBERT_SAMPLE_RATE = 16000
+private const val MAX_INPUT_DURATION_MS = 60_000L
 
-data class FileSelection(val uri: Uri, val displayName: String)
+data class FileSelection(val uri: Uri, val displayName: String, val meta: AudioMeta? = null)
 
 enum class Stage { IDLE, RUNNING, DONE, ERROR }
 
@@ -48,6 +51,7 @@ data class ConversionUiState(
     val input: FileSelection? = null,
     val output: FileSelection? = null,
     val outputFormat: AudioFormat = AudioFormat.WAV,
+    val inputError: String? = null,
     val f0UpKey: Int = 0,
     val speakerId: Long = 0L,
     val synthStatus: ModelLoadStatus = ModelLoadStatus.Empty,
@@ -120,7 +124,28 @@ class ConversionViewModel(app: Application) : AndroidViewModel(app) {
     fun setModel(uri: Uri) = handleSlotSelection(Slot.SYNTH, uri)
     fun setHubert(uri: Uri) = handleSlotSelection(Slot.HUBERT, uri)
     fun setRmvpe(uri: Uri) = handleSlotSelection(Slot.RMVPE, uri)
-    fun setInput(uri: Uri) = _state.update { it.copy(input = resolve(uri)) }
+    fun setInput(uri: Uri) {
+        val ctx: Context = getApplication()
+        val sel = resolve(uri)
+        // Reject overly long inputs upfront so the user sees the limit
+        // before they wait for a doomed conversion. Files we can't probe at
+        // all are treated optimistically (no meta = no rejection).
+        viewModelScope.launch(Dispatchers.IO) {
+            val meta = AudioMetaProbe.probe(ctx, uri)
+            if (meta != null && meta.durationMs > MAX_INPUT_DURATION_MS) {
+                _state.update {
+                    it.copy(
+                        input = null,
+                        inputError = "Input too long (${meta.durationMs / 1000}s). Max 60s.",
+                    )
+                }
+                return@launch
+            }
+            _state.update {
+                it.copy(input = sel.copy(meta = meta), inputError = null)
+            }
+        }
+    }
     fun setOutput(uri: Uri) = _state.update { it.copy(output = resolve(uri)) }
     fun setF0UpKey(value: Int) = _state.update { it.copy(f0UpKey = value) }
     fun setSpeakerId(value: Long) = _state.update { it.copy(speakerId = value) }

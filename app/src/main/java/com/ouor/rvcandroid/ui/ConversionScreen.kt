@@ -137,6 +137,7 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 input = state.input,
                 output = state.output,
                 outputFormat = state.outputFormat,
+                inputError = state.inputError,
                 onPickInput = { pickInput.launch(arrayOf("audio/*")) },
                 onPickOutput = {
                     createOutput.launch(
@@ -242,6 +243,7 @@ private fun IoCard(
     input: FileSelection?,
     output: FileSelection?,
     outputFormat: AudioFormat,
+    inputError: String?,
     onPickInput: () -> Unit,
     onPickOutput: () -> Unit,
 ) {
@@ -250,10 +252,47 @@ private fun IoCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            FileRow("Input audio", input?.displayName, onPickInput)
+            InputRow(input = input, error = inputError, onPick = onPickInput)
             FileRow("Output (${outputFormat.displayName})", output?.displayName, onPickOutput)
         }
     }
+}
+
+@Composable
+private fun InputRow(input: FileSelection?, error: String?, onPick: () -> Unit) {
+    Column {
+        FileRow("Input audio", input?.displayName, onPick)
+        input?.meta?.let { meta ->
+            Text(
+                text = formatMeta(meta),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+        if (error != null) {
+            Text(
+                text = error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+private fun formatMeta(meta: com.ouor.rvcandroid.audio.AudioMeta): String {
+    val seconds = meta.durationMs / 1000
+    val mm = seconds / 60
+    val ss = seconds % 60
+    val rate = if (meta.sampleRate >= 1000) "${meta.sampleRate / 1000f}kHz".replace(".0kHz", "kHz")
+    else "${meta.sampleRate}Hz"
+    val ch = when (meta.channels) {
+        1 -> "Mono"
+        2 -> "Stereo"
+        else -> "${meta.channels}ch"
+    }
+    return "%d:%02d · %s · %s".format(mm, ss, rate, ch)
 }
 
 @Composable
