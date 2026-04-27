@@ -53,6 +53,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import com.ouor.rvcandroid.audio.AudioFormat
+import com.ouor.rvcandroid.audio.HistoryEntry
 import com.ouor.rvcandroid.inference.ModelLoadStatus
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -190,6 +191,24 @@ fun ConversionScreen(vm: ConversionViewModel = viewModel()) {
                 onSpeakerIdChange = vm::setSpeakerId,
                 onOutputFormatChange = vm::setOutputFormat,
             )
+
+            if (state.history.isNotEmpty()) {
+                HistoryCard(
+                    entries = state.history,
+                    activeFile = state.preview.file,
+                    onPlay = vm::loadHistoryEntry,
+                    onSaveAs = { entry ->
+                        vm.loadHistoryEntry(entry)
+                        saveAs.launch(
+                            CreateAudioDocumentRequest(
+                                mime = entry.format.mime,
+                                filename = entry.file.name,
+                            )
+                        )
+                    },
+                    onDelete = vm::deleteHistoryEntry,
+                )
+            }
         }
     }
 
@@ -833,6 +852,103 @@ private fun StepChip(step: Step, state: StepUiState, modifier: Modifier = Modifi
                 overflow = TextOverflow.Ellipsis,
             )
         }
+    }
+}
+
+@Composable
+private fun HistoryCard(
+    entries: List<HistoryEntry>,
+    activeFile: java.io.File?,
+    onPlay: (HistoryEntry) -> Unit,
+    onSaveAs: (HistoryEntry) -> Unit,
+    onDelete: (HistoryEntry) -> Unit,
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    ElevatedCard(elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)) {
+        Column {
+            CardHeader(
+                title = "Recent conversions",
+                subtitle = "${entries.size} saved · LRU 10",
+                expanded = expanded,
+                onToggle = { expanded = !expanded },
+            )
+            AnimatedVisibility(expanded) {
+                Column(
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    entries.forEach { entry ->
+                        HistoryRow(
+                            entry = entry,
+                            isActive = entry.file == activeFile,
+                            onPlay = { onPlay(entry) },
+                            onSaveAs = { onSaveAs(entry) },
+                            onDelete = { onDelete(entry) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryRow(
+    entry: HistoryEntry,
+    isActive: Boolean,
+    onPlay: () -> Unit,
+    onSaveAs: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    Surface(
+        color = if (isActive) cs.secondaryContainer else cs.surfaceVariant,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Text(
+                text = entry.file.name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (isActive) cs.onSecondaryContainer else cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "${entry.format.displayName} · ${formatSize(entry.sizeBytes)} · ${formatRelative(entry.createdAt)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (isActive) cs.onSecondaryContainer else cs.onSurfaceVariant,
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FilledTonalButton(onClick = onPlay) { Text("Play") }
+                OutlinedButton(onClick = onSaveAs) { Text("Save as") }
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = onDelete) {
+                    Text("✕", color = cs.error, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+}
+
+private fun formatSize(bytes: Long): String = when {
+    bytes >= 1_000_000L -> "%.1f MB".format(bytes / 1_000_000f)
+    bytes >= 1_000L -> "%d KB".format(bytes / 1_000L)
+    else -> "$bytes B"
+}
+
+private fun formatRelative(epochMs: Long): String {
+    val deltaSec = (System.currentTimeMillis() - epochMs) / 1000
+    return when {
+        deltaSec < 60 -> "${deltaSec}s ago"
+        deltaSec < 3600 -> "${deltaSec / 60}m ago"
+        deltaSec < 86_400 -> "${deltaSec / 3600}h ago"
+        else -> "${deltaSec / 86_400}d ago"
     }
 }
 
