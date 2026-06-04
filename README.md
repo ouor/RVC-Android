@@ -1,83 +1,131 @@
 # RVC Android
 
-Snapdragon 8 Elite 클래스 디바이스에서 **100% on-device**로 동작하는 RVC
-(Retrieval-based Voice Conversion) 음성 변환 안드로이드 앱.
+<p align="center">
+  <b>English</b> | <a href="./docs/README.ko.md">한국어</a>
+</p>
 
-마이크 녹음 또는 오디오 파일(최대 60초)을 입력하면 voice-changer 호환 RVC
-ONNX 모델로 화자를 변환해 WAV / MP3 / AAC / M4A / FLAC / OGG 중 원하는
-포맷으로 내보낸다. 추론과 인코딩 모두 디바이스에서 끝나며 서버로 오디오를
-전송하지 않는다.
+<p align="center">
+  <img src="docs/img/logo.png" alt="RVC Android" width="440" />
+</p>
 
-## 요구사항
+<p align="center">
+  Voice conversion that stays on your phone — An Android
+  app that swaps your voice using
+  <a href="https://github.com/w-okada/voice-changer">voice-changer</a>-compatible
+  RVC models.
+</p>
 
-- **디바이스**: arm64-v8a, Android 12+ (`minSdk 31`, `targetSdk 36`)
-- **권한**: 마이크 입력을 사용할 때만 `RECORD_AUDIO`
-- **빌드**: JDK 11, Android Studio + Gradle wrapper 동봉
-- **NPU 가속(선택)**: Qualcomm Hexagon V79 (Snapdragon 8 Elite).
-  FP16 QNN context binary는 디바이스 dispatch가 검증됨. W8A16 양자화 빌드는
-  컴파일은 성공하지만 디바이스에서 CPU fallback으로 떨어져 현재 실용 불가
-  (자세한 내용은 `output/README.md`).
+> Unofficial community tool. Not affiliated with the
+> [voice-changer](https://github.com/w-okada/voice-changer) project.
 
-## 모델 (런타임에 SAF로 선택)
+<p align="center">
+  <img src="docs/img/app.jpg" alt="Pick your models and input" width="240" />
+  &nbsp;
+  <img src="docs/img/convert.jpg" alt="Set the pitch and convert" width="240" />
+  &nbsp;
+  <img src="docs/img/result.jpg" alt="Preview and save the result" width="240" />
+</p>
 
-세 슬롯 모두 필수다.
+## When you'd want this
 
-| 슬롯 | 모델 | 비고 |
-|------|------|------|
-| **Synth** | RVC synthesizer ONNX | voice-changer `export2onnx.py` 출력 형식. `custom_metadata_props["metadata"]` JSON 필수 — `samplingRate` / `f0` / `embChannels` / `embedder` / `embOutputLayer` / `useFinalProj`. |
-| **HuBERT** | ContentVec / HuBERT 임베더 | voice-changer의 `content_vec_500.onnx`처럼 `unit12` (768d, v2), `units9` (256d, v1), `unit12s` 출력을 모두 노출하는 형태. Synth 메타데이터에 따라 자동 선택. |
-| **RMVPE** | 피치 추출기 | `waveform[1,N] f32`, `threshold[1] f32` 입력. f0 모델일 때 필수. |
+Sometimes you just want to change a voice with the phone in your hand — no PC, no network.
 
-## 파이프라인
+- **Turn a recording into someone else's voice** — record a short clip from the
+  mic or pick an audio file, and convert it with an RVC model you already have.
+- **Keep your audio off the wire** — conversion and encoding both happen on the
+  device. Nothing is uploaded, so it works in airplane mode.
+- **Swap models whenever you like** — there's no voice baked into the app. Point
+  it at whatever RVC ONNX model you want, right then and there.
 
-`inference/RvcPipeline.kt` 기준:
+## What it does
 
-1. 입력 디코드 → 16 kHz 모노 리샘플 (선형 보간)
-2. HuBERT/ContentVec → `feats[1, T, C]` (50 fps)
-3. RMVPE → `pitchf` + voice-changer와 비트 일치하는 mel `f0_coarse` 양자화,
-   `f0UpKey` 반음 시프트 적용
-4. 임베딩 50 fps → 100 fps 2× nearest 업샘플 (PyTorch
-   `F.interpolate(scale_factor=2)` 와 호환)
-5. Synthesizer → 오디오, `[-1, 1]` 클립
-6. ffmpeg-kit-audio (또는 in-process WAV)로 인코드 → SAF "Save as…"
+- **Changes your voice** — feed it a mic recording or an audio file (up to 60s)
+  and it converts the speaker with your RVC model.
+- **Exports the format you want** — save as WAV, MP3, AAC, M4A, FLAC, or OGG.
+- **Lets you pick the models** — choose the Synth, HuBERT, and RMVPE models with
+  a file picker. Recording straight from the mic works too.
+- **Shows you the input first** — files over 60 seconds are rejected up front,
+  and the input waveform is drawn as a thumbnail.
+- **Plays the result right away** — when conversion finishes, a modal pops up so
+  you can listen on the spot, then export with "Save as…".
+- **Keeps your recent results** — past conversions stay in a history card, so you
+  can reopen a result you dismissed and play or save it again.
+- **Stays fast with the same models** — a loaded model is kept warm in memory, so
+  re-converting with the same combination skips reopening the model.
 
-## UX
+## What you need
 
-- 모델 3종 + 입력은 SAF 피커로 선택, 마이크로 직접 녹음도 가능
-- 입력 파일은 60초 상한 사전 거부, 파형 썸네일 미리 표시
-- 변환 결과는 모달 시트로 떠서 ExoPlayer로 즉시 프리뷰, "Save as…"로 내보내기
-- 최근 변환 결과는 mtime-LRU 히스토리 카드에 보관, 다시 열 수 있음
-- ORT 세션은 ViewModel이 warm 캐시로 들고 있어 같은 모델 조합으로 재변환할 때
-  모델 재오픈 비용을 건너뜀
+- **Device**: arm64-v8a, Android 12+ (`minSdk 31`, `targetSdk 36`)
+- **Permission**: `RECORD_AUDIO`, only when you record from the mic (not needed
+  for file input)
+- **Three models** — all exported as ONNX from the voice-changer tooling. All
+  three slots must be filled before a conversion starts.
 
-## 빌드
+| Slot | Model | Good to know |
+|------|-------|--------------|
+| **Synth** | RVC synthesizer ONNX | Must be the `export2onnx.py` output format from voice-changer. The model has to carry a `custom_metadata_props["metadata"]` JSON (`samplingRate` / `f0` / `embChannels` / `embedder` / `embOutputLayer` / `useFinalProj`). Without it, the model is rejected with "synth has no embedded metadata". |
+| **HuBERT** | ContentVec / HuBERT embedder | Like voice-changer's `content_vec_500.onnx`, exposing the `unit12` (768d, v2), `units9` (256d, v1), and `unit12s` outputs. Which one is used is chosen automatically from the Synth metadata. |
+| **RMVPE** | Pitch extractor | Takes `waveform[1,N] f32` and `threshold[1] f32` inputs. Required for f0 models. |
+
+You get the Synth model by hitting **export to onnx** in the
+[voice-changer](https://github.com/w-okada/voice-changer) desktop client — that's
+what bakes the required metadata into the file.
+
+<p align="center">
+  <img src="docs/img/export.png" alt="Exporting an ONNX model from voice-changer" width="520" />
+</p>
+
+## Getting started
+
+To build and install it yourself:
 
 ```sh
 ./gradlew :app:assembleDebug
 ```
 
-NDK ABI는 `arm64-v8a`만 빌드된다 (`abiFilters` 고정 — ORT 네이티브 ~150 MB
-절약). QNN 가속 경로는 vendored SDK가 필요하며 `qnn` 브랜치에서
-`tools/pull_vendor_deps.sh`로 받아야 한다. `main` 브랜치는 ONNX Runtime 기본
-실행 환경에서 동작한다.
+Once it's installed:
 
-## 모듈 구조
+1. Open the app and pick the **Synth · HuBERT · RMVPE** models with the file
+   picker.
+2. Import an audio file or **record from the mic** (up to 60s).
+3. If you like, adjust the **pitch (f0UpKey)** and **Speaker ID**.
+4. Tap **Convert**, then listen to the result and export it with **Save as…**.
+
+## Good to know
+
+- It all runs **on the device, offline** — no account, no cloud, and your audio
+  never leaves the phone.
+- Input is capped at **60 seconds**; longer files are filtered out before
+  conversion.
+- Models can be large, so the app runs with `largeHeap` and streams the model
+  file to cache to read it via mmap (avoiding Java-heap OOM).
+
+## Under the hood
+
+The conversion pipeline (see `inference/RvcPipeline.kt`):
+
+1. Decode input → resample to 16 kHz mono (linear interpolation)
+2. HuBERT/ContentVec → `feats[1, T, C]` (50 fps)
+3. RMVPE → `pitchf` + mel `f0_coarse` quantization that matches voice-changer
+   bit-for-bit, with the `f0UpKey` semitone shift applied
+4. Embeddings upsampled 50 fps → 100 fps, 2× nearest (compatible with PyTorch
+   `F.interpolate(scale_factor=2)`)
+5. Synthesizer → audio, clipped to `[-1, 1]`
+6. Encode with ffmpeg-kit-audio (or in-process WAV) → SAF "Save as…"
+
+Module layout:
 
 ```
 app/src/main/java/com/ouor/rvcandroid/
 ├── MainActivity.kt
-├── audio/         # 디코드/인코드, 리샘플, 녹음, 프리뷰 플레이어, 히스토리 LRU
-├── inference/     # ORT 세션 캐시, HuBERT/RMVPE/Synth 래퍼, 메타데이터 파서
-└── ui/            # Compose 화면 + ConversionViewModel (StateFlow 기반)
+├── audio/         # decode/encode, resample, recording, preview player, history LRU
+├── inference/     # ORT session cache, HuBERT/RMVPE/Synth wrappers, metadata parser
+└── ui/            # Compose screen + ConversionViewModel (StateFlow-based)
 ```
 
-`output/` — AI Hub 기반 ONNX → QNN context binary 변환 산출물 (gitignored,
-약 2.1 GB). 재생성과 디바이스 검증 절차는 `output/README.md` 참고.
+Tech stack:
 
-## 의존성
-
-- ONNX Runtime Android — 추론
-- ffmpeg-kit-audio (community fork, LGPL) — MP3 / AAC / M4A / FLAC / OGG
-  코덱
-- AndroidX Media3 ExoPlayer — 변환 결과 프리뷰
-- Jetpack Compose + Material3 — UI
+- **Kotlin** + **Jetpack Compose / Material3** — UI
+- **ONNX Runtime Android** — inference
+- **ffmpeg-kit-audio** (community fork, LGPL) — MP3 / AAC / M4A / FLAC / OGG codecs
+- **AndroidX Media3 ExoPlayer** — previewing the result
